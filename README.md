@@ -36,7 +36,7 @@ OKX_PASSWORD=your_okx_password
 在 `TRADE_CONFIG` 中可配置的关键参数：
 
 - `symbol`: 交易对 (默认 `BTC/USDT:USDT`)
-- `leverage`: 杠杆倍数 (默认 50)
+- `leverage`: 杠杆倍数 (默认 10)
 - `timeframe`: K线周期 (默认 `15m`)
 - `test_mode`: 测试模式开关 (默认 `False`)
 - `position_management`: 智能仓位管理配置
