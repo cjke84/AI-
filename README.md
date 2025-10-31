@@ -42,6 +42,7 @@ OKX_PASSWORD=your_okx_password
 - `timeframe`: K线周期 (默认 `15m`)
 - `test_mode`: 测试模式开关 (默认 `False`)
 - `position_management`: 智能仓位管理配置
+- `fixed_position_size': 0.01,  # 🔧 固定仓位大小1下单0.1单位BTC（当智能仓位管理禁用时使用）
 - `hold_signal_config`: HOLD信号减仓功能配置
 
 ## 运行流程
