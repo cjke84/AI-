@@ -3,6 +3,7 @@
 ## 项目概述
 
 这是一个基于Python开发的BTC/USDT永续合约自动化交易机器人，集成了技术分析、市场情绪指标和AI辅助决策功能，可在OKX交易所进行实盘或模拟交易。
+根据布欧的量化日记的修改 原地址https://github.com/huojichuanqi/ds
 
 ## 功能特性
 
