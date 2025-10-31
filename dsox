@@ -43,7 +43,7 @@ exchange = ccxt.okx({
 # 交易参数配置 - 结合两个版本的优点
 TRADE_CONFIG = {
     'symbol': 'BTC/USDT:USDT',  # OKX的合约符号格式
-    'leverage': 50,  # 杠杆倍数,只影响保证金不影响下单价值
+    'leverage': 10,  # 杠杆倍数,只影响保证金不影响下单价值
     'timeframe': '15m',  # 使用15分钟K线
     'test_mode': False,  # 测试模式
     'data_points': 96,  # 24小时数据（96根15分钟K线）
@@ -55,11 +55,11 @@ TRADE_CONFIG = {
     # 新增智能仓位参数
     'position_management': {
         'enable_intelligent_position': False,  # 🆕 新增：是否启用智能仓位管理
-        'base_usdt_amount': 500,  # USDT投入下单基数
+        'base_usdt_amount': 100,  # USDT投入下单基数
         'high_confidence_multiplier': 1.5,
         'medium_confidence_multiplier': 1.0,
         'low_confidence_multiplier': 0.5,
-        'max_position_ratio': 50,  # 单次最大仓位比例
+        'max_position_ratio': 10,  # 单次最大仓位比例
         'trend_strength_multiplier': 1.2,
         # 新增市场因子参数
         'volatility_multiplier': {  # 波动率调整因子
@@ -81,7 +81,7 @@ TRADE_CONFIG = {
     'hold_signal_config': {
         'enable_hold_reduce': True,  # 是否启用HOLD信号减仓功能
         'reduce_on_nth_hold': 3,  # 第几次出现HOLD信号时减仓
-        'reduce_ratio': 0.5  # 减仓比例（0.5表示减半，0.3表示减30%等）
+        'reduce_ratio': 0.5  # 减仓比例（0.5表示减半，0.3表示减30%,1表示全减等）
     }
 }
 
