@@ -40,51 +40,71 @@ exchange = ccxt.okx({
     'password': os.getenv('OKX_PASSWORD'),  # OKX需要交易密码
 })
 
-# 交易参数配置 - 结合两个版本的优点
-TRADE_CONFIG = {
-    'symbol': 'BTC/USDT:USDT',  # OKX的合约符号格式
-    'leverage': 10,  # 杠杆倍数,只影响保证金不影响下单价值
-    'timeframe': '15m',  # 使用15分钟K线
-    'test_mode': False,  # 测试模式
-    'data_points': 96,  # 24小时数据（96根15分钟K线）
-    'analysis_periods': {
-        'short_term': 20,  # 短期均线
-        'medium_term': 50,  # 中期均线
-        'long_term': 96  # 长期趋势
-    },
-    # 新增智能仓位参数
-    'position_management': {
-        'enable_intelligent_position': True,  # 🆕 新增：是否启用智能仓位管理
-        'base_usdt_amount': 100,  # USDT投入下单基数
-        'fixed_position_size': 0.01,  # 🔧 固定仓位大小（1=下单0.1BTC）（当智能仓位管理禁用时使用）
-        'high_confidence_multiplier': 1.5,  # 高信心信号时的仓位倍数
-        'medium_confidence_multiplier': 1.0,  # 中等信心信号时的仓位倍数
-        'low_confidence_multiplier': 0.5,  # 低信心信号时的仓位倍数
-        'max_position_ratio': 20,  # 单次最大仓位比例（占总资金的百分比）
-        'trend_strength_multiplier': 1.2,  # 趋势较强时的仓位倍数
-        # 新增市场因子参数
-        'volatility_multiplier': {  # 波动率调整因子
-            'low': 1.1,    # 低波动率时增加仓位
-            'medium': 1.0, # 中等波动率时正常仓位
-            'high': 0.8    # 高波动率时减少仓位
+
+def load_config():
+    """从配置文件加载交易参数"""
+    config_file = os.path.join(os.path.dirname(__file__), 'config.json')
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        logger.info("✅ 成功加载配置文件")
+        return config
+    except FileNotFoundError:
+        logger.warning("⚠️ 配置文件未找到，使用默认配置")
+        return create_default_config()
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ 配置文件格式错误: {e}")
+        return create_default_config()
+    except Exception as e:
+        logger.error(f"❌ 加载配置文件时出错: {e}")
+        return create_default_config()
+
+
+def create_default_config():
+    """创建默认配置"""
+    return {
+        'symbol': 'BTC/USDT:USDT',
+        'leverage': 10,
+        'timeframe': '15m',
+        'test_mode': False,
+        'data_points': 96,
+        'analysis_periods': {
+            'short_term': 20,
+            'medium_term': 50,
+            'long_term': 96
         },
-        'volume_multiplier': {  # 成交量调整因子
-            'low': 0.8,    # 低成交量时减少仓位
-            'medium': 1.0, # 中等成交量时正常仓位
-            'high': 1.2    # 高成交量时增加仓位
+        'position_management': {
+            'enable_intelligent_position': True,
+            'base_usdt_amount': 100,
+            'fixed_position_size': 0.01,
+            'high_confidence_multiplier': 1.5,
+            'medium_confidence_multiplier': 1.0,
+            'low_confidence_multiplier': 0.5,
+            'max_position_ratio': 20,
+            'trend_strength_multiplier': 1.2,
+            'volatility_multiplier': {
+                'low': 1.1,
+                'medium': 1.0,
+                'high': 0.8
+            },
+            'volume_multiplier': {
+                'low': 0.8,
+                'medium': 1.0,
+                'high': 1.2
+            },
+            'position_decay_factor': 0.9,
+            'min_position': 0.01
         },
-        # 仓位衰减因子（连续同向交易时减少仓位）
-        'position_decay_factor': 0.9,  # 连续同向交易时的仓位衰减系数
-        # 最小仓位（即使在最低配置下也不低于此值）
-        'min_position': 0.01  # 最小仓位数量（张）
-    },
-    # HOLD信号减仓功能配置
-    'hold_signal_config': {
-        'enable_hold_reduce': False,  # 是否启用HOLD信号减仓功能
-        'reduce_on_nth_hold': 2,  # 第几次出现HOLD信号时减仓
-        'reduce_ratio': 0.5  # 减仓比例（0.5表示减半，0.3表示减30%等）
+        'hold_signal_config': {
+            'enable_hold_reduce': False,
+            'reduce_on_nth_hold': 2,
+            'reduce_ratio': 0.5
+        }
     }
-}
+
+
+# 交易参数配置 - 从配置文件加载
+TRADE_CONFIG = load_config()
 
 
 def setup_exchange():
@@ -835,6 +855,12 @@ def execute_intelligent_trade(signal_data, price_data):
         execute_intelligent_trade.base_hold_position = None
 
     current_position = get_current_position()
+    
+    # 显示当前持仓情况
+    if current_position:
+        logger.info(f"📊 当前持仓详情: {current_position['side']}仓 {current_position['size']}张, 入场价: {current_position['entry_price']}, 浮盈: {current_position['unrealized_pnl']:.2f} USDT")
+    else:
+        logger.info("📊 当前无持仓")
 
     # 更新HOLD信号计数器
     if signal_data['signal'] == 'HOLD':
@@ -937,7 +963,6 @@ def execute_intelligent_trade(signal_data, price_data):
     logger.info(f"信心程度: {signal_data['confidence']}")
     logger.info(f"智能仓位: {position_size:.2f} 张")
     logger.info(f"理由: {signal_data['reason']}")
-    logger.info(f"当前持仓: {current_position}")
 
     # 风险管理
     if signal_data['confidence'] == 'LOW' and not TRADE_CONFIG['test_mode']:
@@ -1095,7 +1120,11 @@ def execute_intelligent_trade(signal_data, price_data):
         logger.info("智能交易执行成功")
         time.sleep(2)
         position = get_current_position()
-        logger.info(f"更新后持仓: {position}")
+        # 显示更新后的持仓情况
+        if position:
+            logger.info(f"📊 交易后持仓详情: {position['side']}仓 {position['size']}张, 入场价: {position['entry_price']}, 浮盈: {position['unrealized_pnl']:.2f} USDT")
+        else:
+            logger.info("📊 交易后无持仓")
 
     except Exception as e:
         logger.error(f"交易执行失败: {e}")
@@ -1188,6 +1217,10 @@ def trading_bot():
     logger.info(f"执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
 
+    # 重新加载配置以确保使用最新参数
+    global TRADE_CONFIG
+    TRADE_CONFIG = load_config()
+
     # 1. 获取增强版K线数据
     price_data = get_btc_ohlcv_enhanced()
     if not price_data:
@@ -1212,6 +1245,10 @@ def main():
     logger.info("BTC/USDT OKX自动交易机器人启动成功！")
     logger.info("融合技术指标策略 + OKX实盘接口")
 
+    # 重新加载配置
+    global TRADE_CONFIG
+    TRADE_CONFIG = load_config()
+    
     if TRADE_CONFIG['test_mode']:
         logger.info("当前为模拟模式，不会真实下单")
     else:
