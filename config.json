@@ -1,6 +1,6 @@
 {
   "symbol": "BTC/USDT:USDT",
-  "leverage": 50,
+  "leverage": 10,
   "timeframe": "15m",
   "test_mode": false,
   "data_points": 96,
@@ -13,12 +13,12 @@
   
   "position_management": {
     "enable_intelligent_position": true,
-    "base_usdt_amount": 200,
-    "fixed_position_size": 6.2,
+    "base_usdt_amount": 100,
+    "fixed_position_size": 0.01,
     "high_confidence_multiplier": 1.5,
     "medium_confidence_multiplier": 1.0,
     "low_confidence_multiplier": 0.5,
-    "max_position_ratio": 70,
+    "max_position_ratio": 10,
     "trend_strength_multiplier": 1.2,
     
     "volatility_multiplier": {
