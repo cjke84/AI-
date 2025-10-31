@@ -1,9 +1,12 @@
-BTC/USDT 交易机器人
+# BTC/USDT 交易机器人
 
-这是一个基于深度学习和多种技术指标的自动化交易系统，专门用于在 OKX 交易所上交易 BTC/USDT 永续合约。
-根据布欧的量化日记的修改 原地址https://github.com/huojichuanqi/ds 在原版基础上优化了代码 并添加了一些新功能
+这是一个基于人工智能和多种技术指标的自动化交易系统，专门用于在 OKX 交易所上交易 BTC/USDT 永续合约。
 
-## 功能特性
+该系统通过 DeepSeek AI 大模型分析市场趋势，结合多种技术指标（SMA、EMA、RSI、MACD、布林带等）以及市场情绪数据，实现智能化的交易决策。支持全自动交易执行，也可在测试模式下观察策略表现而不实际下单。
+
+#根据布欧的量化日记的修改 原地址https://github.com/huojichuanqi/ds 在原版基础上优化了代码 并添加了一些新功能
+
+## 🌟 核心功能
 
 ### 1. 智能交易决策
 - 使用 DeepSeek AI 大模型分析市场趋势
@@ -29,11 +32,11 @@ BTC/USDT 交易机器人
 - 交易信号统计分析
 - 错误处理和重试机制
 
-## 配置说明
+## ⚙️ 配置说明
 
-所有配置项都位于 [config.json](file://E:\K\桌面\dsox\dsox2\config.json) 文件中，请参考 [CONFIGURATION.md](file://E:\K\桌面\dsox\dsox2\CONFIGURATION.md) 了解详细配置说明。
+所有配置项都位于 [config.json](config.json) 文件中，请参考 [CONFIGURATION.md](CONFIGURATION.md) 了解详细配置说明。
 
-## 安装和运行
+## 🚀 安装和运行
 
 ### 环境要求
 - Python 3.7+
@@ -42,23 +45,24 @@ BTC/USDT 交易机器人
 ### 安装步骤
 1. 克隆或下载项目代码
 2. 安装依赖包：
-   ```
+   ```bash
    pip install -r requirements.txt
    ```
-3. 配置环境变量：
-   - `DEEPSEEK_API_KEY`: DeepSeek API 密钥
-   - `OKX_API_KEY`: OKX API 密钥
-   - `OKX_SECRET`: OKX API 密钥密文
-   - `OKX_PASSWORD`: OKX 交易密码
-
-4. 根据需要修改 [config.json](file://E:\K\桌面\dsox\dsox2\config.json) 配置文件
+3. 配置环境变量（在 `.env` 文件中）：
+   ```env
+   DEEPSEEK_API_KEY=your_deepseek_api_key
+   OKX_API_KEY=your_okx_api_key
+   OKX_SECRET=your_okx_secret
+   OKX_PASSWORD=your_okx_password
+   ```
+4. 根据需要修改 [config.json](config.json) 配置文件
 
 ### 运行程序
-```
-python dsox2.py
+```bash
+python dsox.py
 ```
 
-## 策略逻辑
+## 📊 策略逻辑
 
 ### 技术分析维度
 1. **趋势分析**（权重40%）
@@ -91,7 +95,7 @@ python dsox2.py
 2. **避免频繁交易**: 同一方向信号可适当加仓，反向信号需严格确认
 3. **仓位管理**: 根据信号信心度调整仓位（LOW:50%, MEDIUM:75%, HIGH:100%）
 
-## 仓位管理
+## 📈 仓位管理
 
 系统支持两种仓位管理模式：
 
@@ -103,7 +107,7 @@ python dsox2.py
    - 使用固定的合约张数进行交易
    - 在配置文件中设置固定仓位大小
 
-## 日志说明
+## 📋 日志说明
 
 程序会生成详细的日志信息，包括：
 - 程序启动和配置信息
@@ -114,7 +118,7 @@ python dsox2.py
 
 日志同时输出到控制台和 `trading_bot.log` 文件中。
 
-## 注意事项
+## ⚠️ 注意事项
 
 1. 请确保 OKX 账户有足够的保证金进行交易
 2. 建议在实盘交易前充分测试策略
@@ -122,7 +126,7 @@ python dsox2.py
 4. 程序会自动设置为全仓模式，请确保了解其风险
 5. 交易涉及风险，请根据自身风险承受能力谨慎操作
 
-## 故障排除
+## 🛠️ 故障排除
 
 如果遇到问题，请检查：
 1. API 密钥是否正确配置
@@ -130,3 +134,9 @@ python dsox2.py
 3. OKX 账户状态是否正常
 4. 配置文件是否正确
 5. 查看日志文件了解详细错误信息
+
+## 📚 附加信息
+
+- [配置参数详解](CONFIGURATION.md) - 详细解释每个配置项的作用
+- [技术指标说明](#) - 各项技术指标的计算方法和使用逻辑
+- [情绪指标接口](#) - 市场情绪数据的获取和使用方式
