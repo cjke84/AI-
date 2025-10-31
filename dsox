@@ -281,7 +281,9 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
 
         # 根据连续同向交易调整仓位（仓位衰减）
         decay_multiplier = 1.0
-        if len(signal_history) >= 2:
+        # 修复：使用全局变量signal_history并添加检查
+        global signal_history
+        if 'signal_history' in globals() and len(signal_history) >= 2:
             last_signals = [s['signal'] for s in signal_history[-2:]]
             # 如果最近两次信号相同且都是BUY或SELL，则应用衰减
             if len(set(last_signals)) == 1 and last_signals[0] in ['BUY', 'SELL']:
