@@ -1,0 +1,98 @@
+# 交易机器人配置说明
+
+本文档详细解释了 `config.json` 配置文件中各个参数的含义和作用。
+
+## 基础交易配置
+
+```json
+{
+  "symbol": "BTC/USDT:USDT",
+  "leverage": 50,
+  "timeframe": "15m",
+  "test_mode": false,
+  "data_points": 96
+}
+```
+
+- `symbol`: 交易对符号，OKX合约格式
+- `leverage`: 杠杆倍数，只影响保证金不影响下单价值
+- `timeframe`: K线周期，使用15分钟K线
+- `test_mode`: 测试模式，设置为 true 时不会真实下单
+- `data_points`: 获取的历史数据点数，96根15分钟K线等于24小时数据
+
+## 分析周期配置
+
+```json
+"analysis_periods": {
+  "short_term": 20,
+  "medium_term": 50,
+  "long_term": 96
+}
+```
+
+- `short_term`: 短期均线周期
+- `medium_term`: 中期均线周期
+- `long_term`: 长期趋势分析周期
+
+## 仓位管理配置
+
+```json
+"position_management": {
+  "enable_intelligent_position": true,
+  "base_usdt_amount": 200,
+  "fixed_position_size": 6.2,
+  "high_confidence_multiplier": 1.5,
+  "medium_confidence_multiplier": 1.0,
+  "low_confidence_multiplier": 0.5,
+  "max_position_ratio": 70,
+  "trend_strength_multiplier": 1.2,
+  "volatility_multiplier": {
+    "low": 1.1,
+    "medium": 1.0,
+    "high": 0.8
+  },
+  "volume_multiplier": {
+    "low": 0.8,
+    "medium": 1.0,
+    "high": 1.2
+  },
+  "position_decay_factor": 0.9,
+  "min_position": 0.01
+}
+```
+
+- `enable_intelligent_position`: 是否启用智能仓位管理
+- `base_usdt_amount`: USDT投入下单基数
+- `fixed_position_size`: 固定仓位大小（当智能仓位管理禁用时使用）
+- `high_confidence_multiplier`: 高信心信号时的仓位倍数
+- `medium_confidence_multiplier`: 中等信心信号时的仓位倍数
+- `low_confidence_multiplier`: 低信心信号时的仓位倍数
+- `max_position_ratio`: 单次最大仓位比例（占总资金的百分比）
+- `trend_strength_multiplier`: 趋势较强时的仓位倍数
+
+### 波动率调整因子
+- `volatility_multiplier.low`: 低波动率时增加仓位
+- `volatility_multiplier.medium`: 中等波动率时正常仓位
+- `volatility_multiplier.high`: 高波动率时减少仓位
+
+### 成交量调整因子
+- `volume_multiplier.low`: 低成交量时减少仓位
+- `volume_multiplier.medium`: 中等成交量时正常仓位
+- `volume_multiplier.high`: 高成交量时增加仓位
+
+- `position_decay_factor`: 连续同向交易时的仓位衰减系数
+- `min_position`: 最小仓位数量（张）
+
+## HOLD信号减仓功能配置
+
+```json
+"hold_signal_config": {
+  "enable_hold_reduce": false,
+  "reduce_on_nth_hold": 2,
+  "reduce_ratio": 0.5
+}
+```
+
+- `enable_hold_reduce`: 是否启用HOLD信号减仓功能
+- `reduce_on_nth_hold`: 第几次出现HOLD信号时减仓
+- `reduce_ratio`: 减仓比例（0.5表示减半）
