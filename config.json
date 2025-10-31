@@ -1,42 +1,36 @@
 {
   "symbol": "BTC/USDT:USDT",
-  "leverage": 10,
+  "leverage": 50,
   "timeframe": "15m",
   "test_mode": false,
   "data_points": 96,
-  
-  "analysis_periods": {
-    "short_term": 20,
-    "medium_term": 50,
-    "long_term": 96
-  },
-  
+  "contract_size": 1,
+  "min_amount": 0.01,
+  "okx_order_tag": "60bb4a8d3416BCDE",
+  "sentiment_api_key": "2b144650-4a16-4eb5-bbcd-70824577687b",
   "position_management": {
     "enable_intelligent_position": true,
-    "base_usdt_amount": 100,
-    "fixed_position_size": 0.01,
+    "base_usdt_amount": 200,
+    "fixed_position_size": 6.2,
+    "default_account_balance": 1000,
     "high_confidence_multiplier": 1.5,
     "medium_confidence_multiplier": 1.0,
     "low_confidence_multiplier": 0.5,
-    "max_position_ratio": 10,
+    "max_position_ratio": 70,
     "trend_strength_multiplier": 1.2,
-    
     "volatility_multiplier": {
       "low": 1.1,
       "medium": 1.0,
       "high": 0.8
     },
-    
     "volume_multiplier": {
       "low": 0.8,
       "medium": 1.0,
       "high": 1.2
     },
-    
     "position_decay_factor": 0.9,
     "min_position": 0.01
   },
-  
   "hold_signal_config": {
     "enable_hold_reduce": false,
     "reduce_on_nth_hold": 2,
