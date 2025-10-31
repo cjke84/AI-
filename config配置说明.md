@@ -1,4 +1,4 @@
-# 交易机器人配置说明
+交易机器人配置说明
 
 本文档详细解释了 `config.json` 配置文件中各个参数的含义和作用。
 
@@ -7,10 +7,14 @@
 ```json
 {
   "symbol": "BTC/USDT:USDT",
-  "leverage": 10,
+  "leverage": 50,
   "timeframe": "15m",
   "test_mode": false,
-  "data_points": 96
+  "data_points": 96,
+  "contract_size": 1,
+  "min_amount": 0.01,
+  "okx_order_tag": "60bb4a8d3416BCDE",
+  "sentiment_api_key": "2b144650-4a16-4eb5-bbcd-70824577687b"
 }
 ```
 
@@ -19,6 +23,10 @@
 - `timeframe`: K线周期，使用15分钟K线
 - `test_mode`: 测试模式，设置为 true 时不会真实下单
 - `data_points`: 获取的历史数据点数，96根15分钟K线等于24小时数据
+- `contract_size`: 合约乘数，默认为1
+- `min_amount`: 最小交易量，默认为0.01
+- `okx_order_tag`: OKX订单标签，用于标识订单来源
+- `sentiment_api_key`: 市场情绪数据API密钥
 
 ## 分析周期配置
 
@@ -41,6 +49,7 @@
   "enable_intelligent_position": true,
   "base_usdt_amount": 200,
   "fixed_position_size": 6.2,
+  "default_account_balance": 1000,
   "high_confidence_multiplier": 1.5,
   "medium_confidence_multiplier": 1.0,
   "low_confidence_multiplier": 0.5,
@@ -64,6 +73,7 @@
 - `enable_intelligent_position`: 是否启用智能仓位管理
 - `base_usdt_amount`: USDT投入下单基数
 - `fixed_position_size`: 固定仓位大小（当智能仓位管理禁用时使用）
+- `default_account_balance`: 当无法获取账户余额时的默认值
 - `high_confidence_multiplier`: 高信心信号时的仓位倍数
 - `medium_confidence_multiplier`: 中等信心信号时的仓位倍数
 - `low_confidence_multiplier`: 低信心信号时的仓位倍数
