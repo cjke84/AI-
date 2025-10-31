@@ -64,7 +64,7 @@ def create_default_config():
     """创建默认配置"""
     return {
         'symbol': 'BTC/USDT:USDT',
-        'leverage': 10,
+        'leverage': 50,
         'timeframe': '15m',
         'test_mode': False,
         'data_points': 96,
@@ -75,12 +75,12 @@ def create_default_config():
         },
         'position_management': {
             'enable_intelligent_position': True,
-            'base_usdt_amount': 100,
-            'fixed_position_size': 0.01,
+            'base_usdt_amount': 200,
+            'fixed_position_size': 6.2,
             'high_confidence_multiplier': 1.5,
             'medium_confidence_multiplier': 1.0,
             'low_confidence_multiplier': 0.5,
-            'max_position_ratio': 20,
+            'max_position_ratio': 70,
             'trend_strength_multiplier': 1.2,
             'volatility_multiplier': {
                 'low': 1.1,
@@ -323,10 +323,12 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
 
     except Exception as e:
         logger.error(f"❌ 仓位计算失败，使用基础仓位: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         # 紧急备用计算
         base_usdt = config['base_usdt_amount']
         contract_size = (base_usdt * TRADE_CONFIG['leverage']) / (
-                    price_data['price'] * TRADE_CONFIG.get('contract_size', 0.01))
+                    price_data['price'] * TRADE_CONFIG.get('contract_size', 1))
         return round(max(contract_size, TRADE_CONFIG.get('min_amount', 0.01)), 2)
 
 
