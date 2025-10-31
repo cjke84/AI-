@@ -43,7 +43,7 @@ exchange = ccxt.okx({
 # 交易参数配置 - 结合两个版本的优点
 TRADE_CONFIG = {
     'symbol': 'BTC/USDT:USDT',  # OKX的合约符号格式
-    'leverage': 10,  # 杠杆倍数,只影响保证金不影响下单价值
+    'leverage': 50,  # 杠杆倍数,只影响保证金不影响下单价值
     'timeframe': '15m',  # 使用15分钟K线
     'test_mode': False,  # 测试模式
     'data_points': 96,  # 24小时数据（96根15分钟K线）
@@ -54,13 +54,14 @@ TRADE_CONFIG = {
     },
     # 新增智能仓位参数
     'position_management': {
-        'enable_intelligent_position': False,  # 🆕 新增：是否启用智能仓位管理
+        'enable_intelligent_position': True,  # 🆕 新增：是否启用智能仓位管理
         'base_usdt_amount': 100,  # USDT投入下单基数
-        'high_confidence_multiplier': 1.5,
-        'medium_confidence_multiplier': 1.0,
-        'low_confidence_multiplier': 0.5,
-        'max_position_ratio': 10,  # 单次最大仓位比例
-        'trend_strength_multiplier': 1.2,
+        'fixed_position_size': 6.2,  # 🔧 固定仓位大小（当智能仓位管理禁用时使用）
+        'high_confidence_multiplier': 1.5,  # 高信心信号时的仓位倍数
+        'medium_confidence_multiplier': 1.0,  # 中等信心信号时的仓位倍数
+        'low_confidence_multiplier': 0.5,  # 低信心信号时的仓位倍数
+        'max_position_ratio': 20,  # 单次最大仓位比例（占总资金的百分比）
+        'trend_strength_multiplier': 1.2,  # 趋势较强时的仓位倍数
         # 新增市场因子参数
         'volatility_multiplier': {  # 波动率调整因子
             'low': 1.1,    # 低波动率时增加仓位
@@ -73,15 +74,15 @@ TRADE_CONFIG = {
             'high': 1.2    # 高成交量时增加仓位
         },
         # 仓位衰减因子（连续同向交易时减少仓位）
-        'position_decay_factor': 0.9,
+        'position_decay_factor': 0.9,  # 连续同向交易时的仓位衰减系数
         # 最小仓位（即使在最低配置下也不低于此值）
-        'min_position': 0.01
+        'min_position': 0.01  # 最小仓位数量（张）
     },
     # HOLD信号减仓功能配置
     'hold_signal_config': {
-        'enable_hold_reduce': True,  # 是否启用HOLD信号减仓功能
-        'reduce_on_nth_hold': 3,  # 第几次出现HOLD信号时减仓
-        'reduce_ratio': 0.5  # 减仓比例（0.5表示减半，0.3表示减30%,1表示全减等）
+        'enable_hold_reduce': False,  # 是否启用HOLD信号减仓功能
+        'reduce_on_nth_hold': 2,  # 第几次出现HOLD信号时减仓
+        'reduce_ratio': 0.5  # 减仓比例（0.5表示减半，0.3表示减30%等）
     }
 }
 
@@ -193,7 +194,7 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
 
     # 🆕 新增：如果禁用智能仓位，使用固定仓位
     if not config.get('enable_intelligent_position', True):
-        fixed_contracts = 6.2  # 固定仓位大小，可以根据需要调整
+        fixed_contracts = config.get('fixed_position_size', 6.2)  # 使用配置中的固定仓位大小
         logger.info(f"🔧 智能仓位已禁用，使用固定仓位: {fixed_contracts} 张")
         return fixed_contracts
 
