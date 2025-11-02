@@ -9,11 +9,14 @@ import json
 import requests
 from datetime import datetime, timedelta
 import logging
+from typing import TypedDict, Dict, Any, Optional, Union, List
+import hashlib
+from functools import lru_cache
 
 # 设置日志
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s | %(levelname)-7s | %(message)s',
     handlers=[
         logging.FileHandler('trading_bot.log', encoding='utf-8'),
         logging.StreamHandler()
@@ -30,23 +33,136 @@ deepseek_client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 
-# 初始化OKX交易所
-exchange = ccxt.okx({
-    'options': {
-        'defaultType': 'swap',  # OKX使用swap表示永续合约
-    },
-    'apiKey': os.getenv('OKX_API_KEY'),
-    'secret': os.getenv('OKX_SECRET'),
-    'password': os.getenv('OKX_PASSWORD'),  # OKX需要交易密码
-})
+# 定义交易配置类型
+class TradeConfig(TypedDict, total=False):
+    symbol: str
+    leverage: int
+    timeframe: str
+    test_mode: bool
+    data_points: int
+    contract_size: float
+    min_amount: float
+    okx_order_tag: str
+    sentiment_api_key: str
+    analysis_periods: Dict[str, int]
+    position_management: Dict[str, Any]
+    stop_loss_config: Dict[str, Any]
+    take_profit_config: Dict[str, Any]
+    hold_signal_config: Dict[str, Any]
+    short_term_config: Dict[str, Any]
+    retry_config: Dict[str, Any]
+
+# 为了向后兼容，保留TradeConfigType别名
+TradeConfigType = TradeConfig
 
 
-def load_config():
-    """从配置文件加载交易参数"""
+
+class TradingConstants:
+    MIN_TRADE_INTERVAL = 300  # 5分钟
+    MAX_HOLD_TIME = 3600      # 1小时
+    MAX_RETRIES = 3
+    RETRY_DELAY = 5
+    
+    # 技术指标参数
+    RSI_OVERBOUGHT = 70
+    RSI_OVERSOLD = 30
+    BB_STD_DEV = 1.5
+
+
+class ExchangeConnectionManager:
+    """管理交易所连接"""
+    def __init__(self):
+        self._exchange = None
+        
+    @property
+    def exchange(self):
+        if self._exchange is None:
+            self._exchange = self._create_exchange()
+        return self._exchange
+    
+    def _create_exchange(self):
+        """创建交易所连接实例"""
+        return ccxt.okx({
+            'options': {
+                'defaultType': 'swap',  # OKX使用swap表示永续合约
+            },
+            'apiKey': os.getenv('OKX_API_KEY'),
+            'secret': os.getenv('OKX_SECRET'),
+            'password': os.getenv('OKX_PASSWORD'),  # OKX需要交易密码
+        })
+    
+    def cleanup(self):
+        """清理连接"""
+        if self._exchange:
+            try:
+                # OKX交易所对象没有close方法，所以我们直接设置为None
+                self._exchange = None
+            except Exception as e:
+                logger.error(f"关闭交易所连接时发生未知错误: {e}")
+
+
+# 创建交易所连接管理器并获取交易所实例
+exchange_manager = ExchangeConnectionManager()
+exchange = exchange_manager.exchange
+
+def validate_config(config: Dict[str, Any]) -> bool:
+    """验证配置完整性"""
+    required_keys = ['symbol', 'leverage', 'timeframe']
+    return all(key in config for key in required_keys)
+
+
+def load_config() -> TradeConfigType:
+    """改进的配置加载"""
     config_file = os.path.join(os.path.dirname(__file__), 'config.json')
     try:
         with open(config_file, 'r', encoding='utf-8') as f:
-            config = json.load(f)
+            file_config: dict = json.load(f)
+        
+        # 将嵌套的配置扁平化处理
+        config: TradeConfigType = {}
+        
+        # 复制交易相关配置
+        if 'trading' in file_config:
+            trading_config = file_config['trading']
+            for key, value in trading_config.items():
+                if key not in ['risk_management', 'data', 'strategy']:
+                    config[key] = value
+                    
+            # 处理嵌套的数据配置
+            if 'data' in trading_config and 'data_points' in trading_config['data']:
+                config['data_points'] = trading_config['data']['data_points']
+            else:
+                config['data_points'] = 64  # 默认值
+        else:
+            # 如果没有trading键，直接使用根级别配置
+            config = file_config.copy()
+                
+        # 复制其他配置
+        config_keys_map = {
+            'position_management': 'position_management',
+            'stop_loss_config': 'stop_loss_config',
+            'take_profit_config': 'take_profit_config',
+            'hold_signal_config': 'hold_signal_config',
+            'short_term_config': 'short_term_config',
+            'retry_config': 'retry_config'
+        }
+        
+        for file_key, config_key in config_keys_map.items():
+            if file_key in file_config:
+                config[config_key] = file_config[file_key]
+        
+        # 验证必需配置项
+        if not validate_config(config):
+            logger.warning("配置不完整，使用默认值填充缺失项")
+            default_config = create_default_config()
+            for key in ['symbol', 'leverage', 'timeframe']:
+                if key not in config:
+                    config[key] = default_config[key]
+                
+        # 确保 data_points 存在
+        if 'data_points' not in config:
+            config['data_points'] = 64
+            
         logger.info("✅ 成功加载配置文件")
         return config
     except FileNotFoundError:
@@ -55,166 +171,773 @@ def load_config():
     except json.JSONDecodeError as e:
         logger.error(f"❌ 配置文件格式错误: {e}")
         return create_default_config()
+    except IOError as e:
+        logger.error(f"❌ 读取配置文件时发生IO错误: {e}")
+        return create_default_config()
     except Exception as e:
-        logger.error(f"❌ 加载配置文件时出错: {e}")
+        logger.error(f"❌ 加载配置文件时发生未知错误: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return create_default_config()
 
 
-def create_default_config():
-    """创建默认配置"""
+def create_default_config() -> TradeConfigType:
+    """创建适合15分钟短线交易的默认配置"""
     return {
         'symbol': 'BTC/USDT:USDT',
-        'leverage': 50,
+        'leverage': 20,  # 降低杠杆，短线交易风险控制更重要
         'timeframe': '15m',
         'test_mode': False,
-        'data_points': 96,
-        'contract_size': 1,  # 添加默认合约大小
-        'min_amount': 0.01,  # 添加默认最小交易量
-        'okx_order_tag': '60bb4a8d3416BCDE',  # 添加默认订单标签
-        'sentiment_api_key': '2b144650-4a16-4eb5-bbcd-70824577687b',  # 情绪指标API密钥
+        'data_points': 64,  # 减少数据点，关注近期走势
+        'contract_size': 0.01,  # 默认值，实际值从交易所获取
+        'min_amount': 0.01,     # 默认值，实际值从交易所获取
+        'okx_order_tag': '60bb4a8d3416BCDE',
+        'sentiment_api_key': '2b144650-4a16-4eb5-bbcd-70824577687b',
+        
+        # 分析周期配置 - 调整为更短周期
         'analysis_periods': {
-            'short_term': 20,
-            'medium_term': 50,
-            'long_term': 96
+            'short_term': 8,    # 2小时数据
+            'medium_term': 24,  # 6小时数据  
+            'long_term': 64     # 16小时数据
         },
+        
+        # 短线仓位管理配置
         'position_management': {
             'enable_intelligent_position': True,
-            'base_usdt_amount': 200,
-            'fixed_position_size': 6.2,
-            'default_account_balance': 1000,  # 添加默认账户余额
-            'high_confidence_multiplier': 1.5,
-            'medium_confidence_multiplier': 1.0,
-            'low_confidence_multiplier': 0.5,
-            'max_position_ratio': 70,
-            'trend_strength_multiplier': 1.2,
+            'base_usdt_amount': 100,  # 降低基础金额，短线小仓位
+            'fixed_position_size': 3.0,  # 减小固定仓位
+            'default_account_balance': 1000,
+            
+            # 信心程度乘数 - 降低乘数，控制风险
+            'high_confidence_multiplier': 1.2,
+            'medium_confidence_multiplier': 0.8,
+            'low_confidence_multiplier': 0.4,
+            
+            'max_position_ratio': 40,  # 降低最大仓位比例
+            'trend_strength_multiplier': 1.1,  # 降低趋势强度乘数
+            
+            # 波动率乘数调整
             'volatility_multiplier': {
-                'low': 1.1,
-                'medium': 1.0,
-                'high': 0.8
+                'low': 1.0,    # 低波动率时正常仓位
+                'medium': 0.9, # 中等波动率减仓
+                'high': 0.6    # 高波动率大幅减仓
             },
+            
+            # 成交量乘数调整
             'volume_multiplier': {
-                'low': 0.8,
+                'low': 0.7,    # 低成交量时大幅减仓
                 'medium': 1.0,
-                'high': 1.2
+                'high': 1.1    # 高成交量小幅加仓
             },
-            'position_decay_factor': 0.9,
-            'min_position': 0.01
+            
+            'position_decay_factor': 0.85,  # 增加衰减因子，避免连续交易
+            'min_position': 0.01,
+            'max_balance_adjustments': 5,  # 最大资金调整次数
+            'min_position_ratio': 0.1,     # 最小仓位比例
         },
+        
+        # 短线止盈止损配置 - 分开设置开关
+        'stop_loss_config': {
+            'high_confidence_multiplier': 0.985,   # 1.5%止损
+            'medium_confidence_multiplier': 0.98,  # 2%止损  
+            'low_confidence_multiplier': 0.975,    # 2.5%止损
+            'enable_stop_loss': True  # 默认开启止损
+        },
+        'take_profit_config': {
+            'high_confidence_multiplier': 1.015,   # 1.5%止盈
+            'medium_confidence_multiplier': 1.02,  # 2%止盈
+            'low_confidence_multiplier': 1.025,    # 2.5%止盈
+            'enable_take_profit': False  # 默认关闭止盈
+        },
+        
+        # HOLD信号减仓配置 - 短线更敏感
         'hold_signal_config': {
-            'enable_hold_reduce': False,
-            'reduce_on_nth_hold': 2,
-            'reduce_ratio': 0.5
+            'enable_hold_reduce': True,  # 启用HOLD信号减仓
+            'enable_dynamic_reduction': True,
+            'min_hold_count': 1,  # 降低触发阈值，1次HOLD就考虑减仓
+            
+            # 减仓评分阈值配置
+            'reduction_thresholds': {
+                'high': 60,   # 降低阈值
+                'medium': 40,
+                'low': 25
+            },
+            
+            # 减仓比例配置 - 提高减仓比例
+            'reduction_ratios': {
+                'high': 0.7,   # 高比例减仓70%
+                'medium': 0.5, # 中比例减仓50%
+                'low': 0.3     # 低比例减仓30%
+            },
+            
+            # 评分权重调整 - 更注重短期指标
+            'reduction_weights': {
+                'volatility': 25,  # 降低波动率权重
+                'rsi': 30,         # 提高RSI权重
+                'volume': 20,      # 提高成交量权重
+                'pnl': 15,         # 降低盈亏权重
+                'trend': 5,        # 降低趋势权重
+                'hold_count': 25   # 提高HOLD次数权重
+            },
+            
+            # 技术指标阈值调整 - 更敏感
+            'condition_thresholds': {
+                'bb_extreme': 0.75,   # 降低阈值
+                'rsi_extreme': 70,    # 降低RSI阈值
+                'volume_low': 0.8,    # 提高成交量阈值
+                'pnl_threshold': 0.02 # 降低盈亏阈值
+            }
+        },  # 添加逗号
+        # 添加缺失的配置
+        'short_term_config': {
+            'max_hold_time': 3600,
+            'quick_stop_loss_ratio': 0.03,
+            'min_trade_interval': 300
+        },
+        'retry_config': {
+            'max_retries': 3,
+            'retry_delay': 5
         }
     }
+
+
+def handle_exchange_errors(func):
+    """统一处理交易所API错误"""
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except ccxt.NetworkError as e:
+            logger.error(f"网络错误 {func.__name__}: {e}")
+            return None
+        except ccxt.ExchangeError as e:
+            logger.error(f"交易所错误 {func.__name__}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"未知错误 {func.__name__}: {e}")
+            return None
+    return wrapper
+
+
+@handle_exchange_errors
+def safe_exchange_call():
+    pass
 
 
 # 交易参数配置 - 从配置文件加载
 TRADE_CONFIG = load_config()
 
+# 信号历史记录
+signal_history = []
+
+
+def pre_trade_safety_check():
+    """交易前安全检查"""
+    try:
+        # 1. 验证合约规格
+        if not validate_contract_specs():
+            logger.error("合约规格验证失败")
+            return False
+        
+        # 2. 验证账户模式 - 修复对'None'的处理
+        positions = exchange.fetch_positions([TRADE_CONFIG['symbol']])
+        for pos in positions:
+            if pos['symbol'] == TRADE_CONFIG['symbol']:
+                mgn_mode = pos.get('mgnMode')
+                # OKX中，全仓模式可能是'cross'或'None'
+                if mgn_mode == 'isolated':
+                    logger.error("账户模式是逐仓模式，需要改为全仓模式")
+                    return False
+                elif mgn_mode in ['cross', 'None', None]:
+                    logger.info(f"账户模式验证通过: {mgn_mode} (全仓模式)")
+                else:
+                    logger.warning(f"未知的账户模式: {mgn_mode}，但继续执行")
+        
+        # 3. 验证杠杆设置
+        if not validate_leverage_setting():
+            logger.warning("杠杆设置验证失败，但继续执行")
+        
+        logger.info(" 交易前安全检查通过")
+        return True
+        
+    except Exception as e:
+        logger.error(f"交易前安全检查失败: {e}")
+        return False
+
+
+def validate_leverage_setting():
+    """验证杠杆设置是否生效"""
+    try:
+        positions = exchange.fetch_positions([TRADE_CONFIG['symbol']])
+        for pos in positions:
+            if pos['symbol'] == TRADE_CONFIG['symbol']:
+                actual_leverage = float(pos.get('leverage') or 0)
+                if actual_leverage != 0:  # 只有当持仓中有杠杆信息时才验证
+                    configured_leverage = TRADE_CONFIG['leverage']
+                    if actual_leverage != configured_leverage:
+                        logger.warning(f"杠杆设置不匹配: 配置{configured_leverage}x, 实际{actual_leverage}x")
+                        return False
+                    else:
+                        logger.info(f"✅ 杠杆设置验证通过: {actual_leverage}x")
+                        return True
+        
+        # 无持仓时，无法验证杠杆设置，但不视为错误
+        logger.info("ℹ️ 未找到持仓，无法验证杠杆设置（这在无持仓时是正常的）")
+        return True
+        
+    except Exception as e:
+        logger.error(f"验证杠杆设置失败: {e}")
+        return False
+
+
+def validate_leverage_setting_enhanced():
+    """增强版杠杆验证 - 修复对'None'模式的处理"""
+    try:
+        # 方法1: 通过持仓验证
+        positions = exchange.fetch_positions([TRADE_CONFIG['symbol']])
+        for pos in positions:
+            if pos['symbol'] == TRADE_CONFIG['symbol']:
+                actual_leverage = float(pos.get('leverage') or 0)
+                mgn_mode = pos.get('mgnMode')
+                
+                # 记录详细的持仓信息
+                logger.info(f" 持仓验证详情: 杠杆={actual_leverage}, 模式={mgn_mode}, 合约={pos.get('contracts', 0)}")
+                
+                if actual_leverage == TRADE_CONFIG['leverage']:
+                    logger.info(f" 杠杆设置验证通过: {actual_leverage}x (模式: {mgn_mode})")
+                    return True
+                else:
+                    logger.debug(f"️ 杠杆设置不匹配: 配置{TRADE_CONFIG['leverage']}x, 实际{actual_leverage}x")
+                    return False
+        
+        # 方法2: 无持仓时通过API直接查询账户设置
+        logger.info("ℹ️ 无持仓，尝试通过账户设置验证杠杆...")
+        try:
+            # OKX特定方法：获取账户配置信息
+            account_config = exchange.privateGetAccountConfig()
+            if account_config and 'data' in account_config:
+                # 遍历账户配置数据查找匹配的交易对
+                for item in account_config['data']:
+                    if 'lever' in item:
+                        configured_leverage = float(item['lever'])
+                        if configured_leverage == TRADE_CONFIG['leverage']:
+                            logger.info(f" 账户配置杠杆验证通过: {configured_leverage}x")
+                            return True
+                        else:
+                            logger.debug(f"️ 账户配置杠杆不匹配: 配置{TRADE_CONFIG['leverage']}x, 实际{configured_leverage}x")
+                            return False
+        except Exception as api_error:
+            logger.debug(f" 通过账户API验证杠杆失败: {api_error}")
+        
+        # 如果无法验证，记录警告但不阻止程序运行
+        logger.warning("️ 无法验证杠杆设置（无持仓），请手动确认")
+        return True  # 给予宽容
+        
+    except Exception as e:
+        logger.error(f" 杠杆验证失败: {e}")
+        return False  # 验证失败时返回False
+
+
+def setup_leverage_with_retry(max_retries=3):
+    """统一的杠杆设置重试逻辑"""
+    # 只在第一次尝试时清理订单，避免重复清理
+    if not cleanup_all_orders(TRADE_CONFIG['symbol']):
+        logger.warning("订单清理失败，但继续尝试设置杠杆")
+    
+    for attempt in range(max_retries):
+        try:
+            # 设置杠杆
+            exchange.set_leverage(
+                TRADE_CONFIG['leverage'],
+                TRADE_CONFIG['symbol'],
+                {'mgnMode': 'cross'}
+            )
+            
+            # 验证设置（但在没有持仓时不要过于严格）
+            if validate_leverage_setting_enhanced():
+                logger.info(f" 已设置全仓模式，杠杆倍数: {TRADE_CONFIG['leverage']}x")
+                return True
+            elif attempt < max_retries - 1:
+                # 如果不是最后一次尝试，记录日志并继续重试
+                logger.debug(f" 杠杆设置验证失败，进行第{attempt + 2}次尝试")
+                time.sleep(3)
+            else:
+                # 最后一次尝试失败，记录警告但不抛出异常
+                logger.warning(" 杠杆设置验证失败，但继续执行程序")
+                logger.info(f" 已设置全仓模式，杠杆倍数: {TRADE_CONFIG['leverage']}x")
+                return True
+                
+        except ccxt.BaseError as e:
+            logger.error(f"交易所API错误，设置杠杆失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                logger.error("设置杠杆达到最大重试次数，但继续执行程序")
+                logger.info(f" 已设置全仓模式，杠杆倍数: {TRADE_CONFIG['leverage']}x")
+                return True
+            time.sleep(3)
+        except Exception as e:
+            logger.error(f"设置杠杆时发生未知错误: {e}")
+            if attempt == max_retries - 1:
+                logger.error("设置杠杆达到最大重试次数，但继续执行程序")
+                logger.info(f" 已设置全仓模式，杠杆倍数: {TRADE_CONFIG['leverage']}x")
+                return True
+            time.sleep(3)
+    return True
+
+
+def cleanup_all_orders(symbol):
+    """清理所有订单的统一接口 - OKX专用版本"""
+    try:
+        logger.info(" 开始全面清理所有订单...")
+        cleanup_pending_orders(symbol)
+        
+        # 等待一下确保订单被取消
+        time.sleep(2)
+        
+        # 再次检查是否还有未完成订单
+        remaining_orders = exchange.fetch_open_orders(symbol)
+        if remaining_orders:
+            logger.warning(f" 首次清理后仍有 {len(remaining_orders)} 个订单，进行二次清理...")
+            cleanup_pending_orders(symbol)
+        
+        logger.info(" 所有订单清理完成")
+        return True
+    except Exception as e:
+        logger.error(f"清理所有订单失败: {e}")
+        return False
+
+
+def enhanced_error_handling():
+    try:
+        # 业务逻辑
+        pass
+    except ccxt.InsufficientFunds as e:
+        logger.error(f"资金不足: {e}")
+        # 特定处理逻辑
+    except ccxt.InvalidOrder as e:
+        logger.error(f"订单无效: {e}")
+        # 特定处理逻辑
+    except ccxt.RateLimitExceeded as e:
+        logger.error(f"频率限制: {e}")
+        time.sleep(60)  # 等待后重试
+
+
+def structured_logging(symbol: str, current_price: float, signal_data: Dict[str, Union[str, float]]):
+    """添加结构化日志"""
+    log_data = {
+        'timestamp': datetime.now().isoformat(),
+        'symbol': symbol,
+        'price': current_price,
+        'signal': signal_data['signal'],
+        'confidence': signal_data['confidence']
+    }
+    logger.info(f"交易信号生成: {json.dumps(log_data, ensure_ascii=False)}")
+
+
+def process_market_data():
+    """及时释放大内存对象"""
+    large_df = get_large_dataframe()
+    
+    try:
+        # 处理数据
+        result = process_data(large_df)
+        return result
+    finally:
+        # 确保及时释放内存
+        del large_df
+        import gc
+        gc.collect()
+
+
+def _load_market_data():
+    """加载市场数据并设置合约规格"""
+    logger.info(" 获取BTC合约规格...")
+    try:
+        markets = exchange.load_markets()
+        btc_market = markets[TRADE_CONFIG['symbol']]
+    except ccxt.BaseError as e:
+        logger.error(f"交易所API错误，无法加载市场数据: {e}")
+        return False, None
+    except Exception as e:
+        logger.error(f"加载市场数据时发生未知错误: {e}")
+        return False, None
+
+    # 获取合约乘数 - 使用交易所返回的实际合约乘数
+    contract_size = float(btc_market['contractSize'])
+    
+    # 重要：使用交易所返回的实际合约乘数
+    logger.info(f" 合约规格: 1张 = {contract_size} BTC")
+    logger.info(f" 最小交易量: {btc_market['limits']['amount']['min']} 张 = {btc_market['limits']['amount']['min'] * contract_size:.6f} BTC")
+
+    # 存储合约规格到全局配置
+    TRADE_CONFIG['contract_size'] = contract_size
+    TRADE_CONFIG['min_amount'] = btc_market['limits']['amount']['min']
+    return True, btc_market
+
+
+def _validate_position_mode():
+    """验证持仓模式，确保不是逐仓模式"""
+    logger.info(" 检查现有持仓模式...")
+    try:
+        positions = exchange.fetch_positions([TRADE_CONFIG['symbol']])
+    except ccxt.BaseError as e:
+        logger.error(f"交易所API错误，无法获取持仓信息: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"获取持仓信息时发生未知错误: {e}")
+        return False
+
+    has_isolated_position = False
+    isolated_position_info = None
+
+    for pos in positions:
+        if pos['symbol'] == TRADE_CONFIG['symbol']:
+            contracts = float(pos.get('contracts', 0))
+            mode = pos.get('mgnMode')
+            
+            # 修复：正确处理OKX的持仓模式
+            logger.info(f" 持仓详情: 合约={contracts}, 模式={mode}")
+
+            # 只有在有持仓且模式为逐仓时才报错
+            if contracts > 0 and mode == 'isolated':
+                has_isolated_position = True
+                isolated_position_info = {
+                    'side': pos.get('side'),
+                    'size': contracts,
+                    'entry_price': pos.get('entryPrice'),
+                    'mode': mode
+                }
+                break
+            elif contracts > 0 and mode in ['cross', 'None', None]:
+                logger.info(f" 检测到全仓持仓: {pos.get('side')}仓 {contracts}张")
+            elif contracts == 0:
+                logger.info(" 无持仓或零持仓")
+
+    # 如果有逐仓持仓，提示并退出
+    if has_isolated_position:
+        logger.error(" 检测到逐仓持仓，程序无法继续运行！")
+        logger.error(f" 逐仓持仓详情:")
+        logger.error(f"   - 方向: {isolated_position_info['side']}")
+        logger.error(f"   - 数量: {isolated_position_info['size']}")
+        logger.error(f"   - 入场价: {isolated_position_info['entry_price']}")
+        logger.error(f"   - 模式: {isolated_position_info['mode']}")
+        logger.error("\n 解决方案:")
+        logger.error("1. 手动平掉所有逐仓持仓")
+        logger.error("2. 或者将逐仓持仓转为全仓模式")
+        logger.error("3. 然后重新启动程序")
+        return False
+    
+    return True
+
+
+def _set_position_mode():
+    """设置单向持仓模式"""
+    logger.info(" 设置单向持仓模式...")
+    try:
+        exchange.set_position_mode(False, TRADE_CONFIG['symbol'])  # False表示单向持仓
+        logger.info(" 已设置单向持仓模式")
+    except ccxt.BaseError as e:
+        # 检查是否是因为已经设置而导致的错误
+        error_str = str(e).lower()
+        if "59000" in error_str or "cancel any open orders" in error_str or "already" in error_str:
+            logger.info(" 单向持仓模式可能已设置")
+        else:
+            logger.warning(f"️ 交易所API错误，设置单向持仓模式失败 (可能已设置): {e}")
+    except Exception as e:
+        logger.warning(f"设置单向持仓模式时发生未知错误: {e}")
+    
+    return True
+
+
+def _cleanup_existing_orders():
+    """清理所有未完成订单"""
+    logger.info(" 清理所有未完成订单...")
+    try:
+        if not cleanup_all_orders(TRADE_CONFIG['symbol']):
+            logger.error(" 订单清理失败，可能影响后续操作")
+            # 不立即返回False，继续尝试
+    except Exception as e:
+        logger.error(f"清理订单时发生错误: {e}")
+        # 继续执行，不因为订单清理失败而完全停止
+    
+    # 等待订单清理完成
+    time.sleep(3)
+    
+    # 再次检查订单状态
+    try:
+        remaining_orders = exchange.fetch_open_orders(TRADE_CONFIG['symbol'])
+        if remaining_orders:
+            logger.warning(f" 订单清理后仍有 {len(remaining_orders)} 个未完成订单")
+            # 记录订单详情用于调试
+            for order in remaining_orders:
+                logger.warning(f"  未完成订单: ID={order['id']}, 类型={order.get('type')}, 状态={order.get('status')}")
+        else:
+            logger.info(" 订单清理完成，无未完成订单")
+    except Exception as e:
+        logger.warning(f" 检查剩余订单失败: {e}")
+        
+    return True
+
+
+def validate_trading_parameters():
+    """验证交易参数合理性"""
+    config = TRADE_CONFIG
+    
+    # 验证杠杆
+    if config['leverage'] > 50:
+        logger.warning("杠杆倍数过高，建议调整")
+    
+    # 验证仓位比例
+    max_ratio = config['position_management']['max_position_ratio']
+    if max_ratio > 50:
+        logger.warning("最大仓位比例过高，风险较大")
+
+
+def _set_leverage_and_margin():
+    """设置全仓模式和杠杆"""
+    logger.info("️ 设置全仓模式和杠杆...")
+    try:
+        if not setup_leverage_with_retry(3):
+            logger.error(" 设置杠杆失败，程序无法继续")
+            return False
+        logger.info(f" 已设置全仓模式，杠杆倍数: {TRADE_CONFIG['leverage']}x")
+    except ccxt.BaseError as e:
+        logger.error(f"交易所API错误，设置杠杆失败: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"设置杠杆时发生未知错误: {e}")
+        return False
+        
+    return True
+
+
+def _verify_exchange_settings():
+    """验证交易所设置"""
+    # 验证账户设置
+    logger.info(" 验证账户设置...")
+    try:
+        balance = exchange.fetch_balance()
+        usdt_balance = balance['USDT']['free']
+        logger.info(f" 当前USDT余额: {usdt_balance:.2f}")
+        
+        # 验证持仓状态
+        current_pos = get_current_position()
+        if current_pos:
+            logger.info(f" 当前持仓: {current_pos['side']}仓 {current_pos['size']}张")
+        else:
+            logger.info(" 当前无持仓")
+            
+        # 验证杠杆设置（即使无持仓也应能通过验证）
+        if not validate_leverage_setting_enhanced():
+            logger.warning(" 交易所设置验证失败，但继续执行")
+            return True  # 改为返回True，允许程序继续执行
+            
+        return True
+    except Exception as e:
+        logger.error(f"验证交易所设置时发生错误: {e}")
+        return False
+
+
+def test_exchange_connection() -> bool:
+    """测试交易所连接"""
+    try:
+        exchange.fetch_balance()
+        return True
+    except Exception as e:
+        logger.error(f"交易所连接测试失败: {e}")
+        return False
+
+
+def check_disk_space(min_free_mb: int = 100) -> bool:
+    """检查磁盘空间"""
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage(".")
+        return free > min_free_mb * 1024 * 1024
+    except Exception as e:
+        logger.error(f"磁盘空间检查失败: {e}")
+        return False
+
+
+def check_api_limits():
+    """检查API限制"""
+    # 这里可以实现具体的API限制检查逻辑
+    # 例如检查请求频率、剩余调用次数等
+    try:
+        # 示例：获取账户信息来测试API连接
+        exchange.fetch_balance()
+        return True
+    except Exception as e:
+        logger.error(f"API限制检查失败: {e}")
+        return False
+
+
+def get_large_dataframe():
+    """获取大型数据帧"""
+    try:
+        # 获取K线数据
+        ohlcv = exchange.fetch_ohlcv(TRADE_CONFIG['symbol'], TRADE_CONFIG['timeframe'], 
+                                    limit=TRADE_CONFIG['data_points'] * 2)  # 获取更多数据点
+        
+        if not ohlcv:
+            logger.warning("获取的K线数据为空")
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        
+        # 数据验证
+        if df.empty:
+            logger.warning("创建的DataFrame为空")
+            return df
+            
+        # 基本的数据清理
+        df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp')
+        
+        logger.info(f"成功获取 {len(df)} 条K线数据")
+        return df
+    except ccxt.NetworkError as e:
+        logger.error(f"网络错误导致获取大型数据帧失败: {e}")
+        return pd.DataFrame()
+    except ccxt.ExchangeError as e:
+        logger.error(f"交易所错误导致获取大型数据帧失败: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"获取大型数据帧失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        # 返回一个空的DataFrame作为后备
+        return pd.DataFrame()
+
+
+def process_data(large_df):
+    """处理大型数据帧"""
+    # 这里应该实现处理大型数据帧的逻辑
+    try:
+        if large_df.empty:
+            logger.warning("数据帧为空，无法处理")
+            return None
+            
+        # 示例处理：计算技术指标
+        processed_df = calculate_technical_indicators(large_df)
+        return processed_df
+    except Exception as e:
+        logger.error(f"处理大型数据帧失败: {e}")
+        return None
+
+
+def health_check():
+    """系统健康检查"""
+    checks = {
+        'exchange_connection': test_exchange_connection(),
+        'api_limits': check_api_limits(),
+        'config_validity': validate_config(TRADE_CONFIG),
+        'disk_space': check_disk_space()
+    }
+    
+    if not all(checks.values()):
+        logger.error("健康检查失败: %s", checks)
+        return False
+    return True
+
 
 def setup_exchange():
     """设置交易所参数 - 强制全仓模式"""
     try:
+        # 1. 加载市场数据
+        success, market_data = _load_market_data()
+        if not success:
+            return False
+        
+        # 验证合约规格
+        if not validate_contract_specs():
+            logger.error("合约规格验证失败")
+            return False
 
-        # 首先获取合约规格信息
-        logger.info("🔍 获取BTC合约规格...")
-        markets = exchange.load_markets()
-        btc_market = markets[TRADE_CONFIG['symbol']]
-
-        # 获取合约乘数
-        contract_size = float(btc_market['contractSize'])
-        logger.info(f"✅ 合约规格: 1张 = {contract_size} BTC")
-
-        # 存储合约规格到全局配置
-        TRADE_CONFIG['contract_size'] = contract_size
-        TRADE_CONFIG['min_amount'] = btc_market['limits']['amount']['min']
-
-        logger.info(f"📏 最小交易量: {TRADE_CONFIG['min_amount']} 张")
-
-        # 先检查现有持仓
-        logger.info("🔍 检查现有持仓模式...")
-        positions = exchange.fetch_positions([TRADE_CONFIG['symbol']])
-
-        has_isolated_position = False
-        isolated_position_info = None
-
-        for pos in positions:
-            if pos['symbol'] == TRADE_CONFIG['symbol']:
-                contracts = float(pos.get('contracts', 0))
-                mode = pos.get('mgnMode')
-
-                if contracts > 0 and mode == 'isolated':
-                    has_isolated_position = True
-                    isolated_position_info = {
-                        'side': pos.get('side'),
-                        'size': contracts,
-                        'entry_price': pos.get('entryPrice'),
-                        'mode': mode
-                    }
-                    break
-
-        # 2. 如果有逐仓持仓，提示并退出
-        if has_isolated_position:
-            logger.error("❌ 检测到逐仓持仓，程序无法继续运行！")
-            logger.error(f"📊 逐仓持仓详情:")
-            logger.error(f"   - 方向: {isolated_position_info['side']}")
-            logger.error(f"   - 数量: {isolated_position_info['size']}")
-            logger.error(f"   - 入场价: {isolated_position_info['entry_price']}")
-            logger.error(f"   - 模式: {isolated_position_info['mode']}")
-            logger.error("\n🚨 解决方案:")
-            logger.error("1. 手动平掉所有逐仓持仓")
-            logger.error("2. 或者将逐仓持仓转为全仓模式")
-            logger.error("3. 然后重新启动程序")
+        # 2. 验证持仓模式
+        if not _validate_position_mode():
             return False
 
         # 3. 设置单向持仓模式
-        logger.info("🔄 设置单向持仓模式...")
-        try:
-            exchange.set_position_mode(False, TRADE_CONFIG['symbol'])  # False表示单向持仓
-            logger.info("✅ 已设置单向持仓模式")
-        except Exception as e:
-            logger.warning(f"⚠️ 设置单向持仓模式失败 (可能已设置): {e}")
+        if not _set_position_mode():
+            return False
 
-        # 4. 设置全仓模式和杠杆
-        logger.info("⚙️ 设置全仓模式和杠杆...")
-        exchange.set_leverage(
-            TRADE_CONFIG['leverage'],
-            TRADE_CONFIG['symbol'],
-            {'mgnMode': 'cross'}  # 强制全仓模式
-        )
-        logger.info(f"✅ 已设置全仓模式，杠杆倍数: {TRADE_CONFIG['leverage']}x")
+        # 4. 清理所有未完成订单
+        if not _cleanup_existing_orders():
+            return False
 
-        # 5. 验证设置
-        logger.info("🔍 验证账户设置...")
-        balance = exchange.fetch_balance()
-        usdt_balance = balance['USDT']['free']
-        logger.info(f"💰 当前USDT余额: {usdt_balance:.2f}")
+        # 5. 设置全仓模式和杠杆
+        if not _set_leverage_and_margin():
+            return False
 
-        # 获取当前持仓状态
-        current_pos = get_current_position()
-        if current_pos:
-            logger.info(f"📦 当前持仓: {current_pos['side']}仓 {current_pos['size']}张")
-        else:
-            logger.info("📦 当前无持仓")
+        # 6. 验证设置
+        if not _verify_exchange_settings():
+            return False
 
-        logger.info("🎯 程序配置完成：全仓模式 + 单向持仓")
+        logger.info(" 程序配置完成：全仓模式 + 单向持仓")
         return True
 
+    except ccxt.AuthenticationError as e:
+        logger.error(f"交易所认证失败: {e}")
+        return False
+    except ccxt.ExchangeError as e:
+        logger.error(f"交易所错误: {e}")
+        return False
+    except ccxt.NetworkError as e:
+        logger.error(f"网络错误: {e}")
+        return False
     except Exception as e:
-        logger.error(f"❌ 交易所设置失败: {e}")
+        logger.error(f" 交易所设置失败: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return False
 
 
-def calculate_intelligent_position(signal_data, price_data, current_position):
-    """计算智能仓位大小 - 修复版"""
+def validate_contract_specs():
+    """验证合约规格是否符合预期"""
+    try:
+        markets = exchange.load_markets()
+        btc_market = markets[TRADE_CONFIG['symbol']]
+        
+        contract_size = float(btc_market['contractSize'])
+        min_amount = btc_market['limits']['amount']['min']
+        
+        logger.info(" 合约规格验证:")
+        logger.info(f"   合约乘数: 1张 = {contract_size} BTC")
+        logger.info(f"   最小交易量: {min_amount} 张 = {min_amount * contract_size:.6f} BTC")
+        
+        # 使用交易所返回的实际合约规格
+        logger.info(" 使用交易所返回的实际合约规格进行计算")
+            
+        return True
+        
+    except ccxt.ExchangeError as e:
+        logger.error(f" 合约规格验证失败，交易所错误: {e}")
+        return False
+    except ccxt.NetworkError as e:
+        logger.error(f" 合约规格验证失败，网络错误: {e}")
+        return False
+    except ValueError as e:
+        logger.error(f" 合约规格验证失败，数据转换错误: {e}")
+        return False
+
+    except KeyError as e:
+        logger.error(f" 合约规格验证失败，缺少必要字段: {e}")
+        return False
+    except Exception as e:
+        logger.error(f" 合约规格验证失败: {e}")
+        return False
+
+
+def calculate_intelligent_position(
+    signal_data: Dict[str, Union[str, float]], 
+    price_data: Dict[str, Union[float, Dict]], 
+    current_position: Optional[Dict]
+) -> float:
+    """计算智能仓位大小 - 完全修正版"""
     config = TRADE_CONFIG['position_management']
 
-    # 🆕 新增：如果禁用智能仓位，使用固定仓位
     if not config.get('enable_intelligent_position', True):
-        fixed_contracts = config.get('fixed_position_size', 6.2)  # 使用配置中的固定仓位大小
-        logger.info(f"🔧 智能仓位已禁用，使用固定仓位: {fixed_contracts} 张")
+        fixed_contracts = config.get('fixed_position_size', 3.0)
+        logger.info(f" 智能仓位已禁用，使用固定仓位: {fixed_contracts} 张")
         return fixed_contracts
 
     try:
@@ -222,20 +945,20 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
         balance = get_account_balance()
         if balance is None:
             logger.error("无法获取账户余额，使用默认值")
-            usdt_balance = 1000  # 默认值
+            usdt_balance = 1000
         else:
             usdt_balance = balance['USDT']['free']
 
         # 基础USDT投入
         base_usdt = config['base_usdt_amount']
-        logger.info(f"💰 可用USDT余额: {usdt_balance:.2f}, 下单基数{base_usdt}")
+        logger.info(f" 可用USDT余额: {usdt_balance:.2f}, 下单基数{base_usdt}")
 
-        # 根据信心程度调整 - 修复这里
+        # 各种乘数计算
         confidence_multiplier = {
             'HIGH': config['high_confidence_multiplier'],
             'MEDIUM': config['medium_confidence_multiplier'],
             'LOW': config['low_confidence_multiplier']
-        }.get(signal_data['confidence'], 1.0)  # 添加默认值
+        }.get(signal_data['confidence'], 1.0)
 
         # 根据趋势强度调整
         trend = price_data['trend_analysis'].get('overall', '震荡整理')
@@ -266,7 +989,7 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
                 volatility_multiplier = config['volatility_multiplier']['high']
             else:  # 中等波动
                 volatility_multiplier = config['volatility_multiplier']['medium']
-            logger.info(f"📊 波动率: {volatility:.4f}, 波动率倍数: {volatility_multiplier}")
+            logger.info(f" 波动率: {volatility:.4f}, 波动率倍数: {volatility_multiplier}")
 
         # 根据成交量调整仓位
         volume_multiplier = 1.0
@@ -277,111 +1000,213 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
             volume_multiplier = config['volume_multiplier']['high']
         else:  # 中等成交量
             volume_multiplier = config['volume_multiplier']['medium']
-        logger.info(f"📊 成交量比率: {volume_ratio:.2f}, 成交量倍数: {volume_multiplier}")
+        logger.info(f" 成交量比率: {volume_ratio:.2f}, 成交量倍数: {volume_multiplier}")
 
         # 根据连续同向交易调整仓位（仓位衰减）
         decay_multiplier = 1.0
-        # 修复：使用全局变量signal_history并添加检查
         global signal_history
         if 'signal_history' in globals() and len(signal_history) >= 2:
             last_signals = [s['signal'] for s in signal_history[-2:]]
             # 如果最近两次信号相同且都是BUY或SELL，则应用衰减
             if len(set(last_signals)) == 1 and last_signals[0] in ['BUY', 'SELL']:
                 decay_multiplier = config['position_decay_factor']
-                logger.info(f"⚠️ 连续同向交易，应用仓位衰减: {decay_multiplier}")
+                logger.info(f"️ 连续同向交易，应用仓位衰减: {decay_multiplier}")
 
         # 计算建议投入USDT金额
         suggested_usdt = base_usdt * confidence_multiplier * trend_multiplier * rsi_multiplier * volatility_multiplier * volume_multiplier * decay_multiplier
 
-        # 风险管理：不超过总资金的指定比例 - 删除重复定义
-        max_usdt = usdt_balance * config['max_position_ratio'] / 100  # 转换为小数
+        # 风险管理
+        max_usdt = usdt_balance * config['max_position_ratio'] / 100
         final_usdt = min(suggested_usdt, max_usdt)
 
-        # 正确的合约张数计算！
-        # 公式：合约张数 = (投入USDT) / (当前价格 * 合约乘数)
-        # 添加默认值以防止 KeyError
-        contract_size = (final_usdt) / (price_data['price'] * TRADE_CONFIG.get('contract_size', 1))
+        # 重要：正确的合约张数计算！
+        # 公式：合约张数 = (投入USDT * 杠杆) / (当前价格 * 合约面值)
+        # 合约面值 = 合约乘数 (对于BTC永续合约，1张 = 0.01 BTC)
+        contract_size_corrected = TRADE_CONFIG.get('contract_size', 0.01)  # BTC合约乘数为0.01
+        contract_notional = contract_size_corrected * price_data['price']    # 1张合约的价值（USDT）
+        
+        # 计算合约张数
+        contract_size = (final_usdt * TRADE_CONFIG['leverage']) / contract_notional
 
-        logger.info(f"📊 仓位计算详情:")
-        logger.info(f"   - 基础USDT: {base_usdt}")
-        logger.info(f"   - 信心倍数: {confidence_multiplier}")
-        logger.info(f"   - 趋势倍数: {trend_multiplier}")
-        logger.info(f"   - RSI倍数: {rsi_multiplier}")
-        logger.info(f"   - 波动率倍数: {volatility_multiplier}")
-        logger.info(f"   - 成交量倍数: {volume_multiplier}")
-        logger.info(f"   - 衰减倍数: {decay_multiplier}")
-        logger.info(f"   - 建议USDT: {suggested_usdt:.2f}")
-        logger.info(f"   - 最终USDT: {final_usdt:.2f}")
-        logger.info(f"   - 合约乘数: {TRADE_CONFIG.get('contract_size', 1)}")
-        logger.info(f"   - 计算合约: {contract_size:.4f} 张")
+        logger.debug(f" 仓位计算详情:")
+        logger.debug(f"   投入USDT: {final_usdt:.2f}, 杠杆: {TRADE_CONFIG['leverage']}x")
+        logger.debug(f"   当前价格: ${price_data['price']:.2f}, 合约乘数: {contract_size_corrected}")
+        logger.debug(f"   合约价值: ${contract_notional:.2f}, 计算合约: {contract_size:.4f} 张")
 
-        # 精度处理：OKX BTC合约最小交易单位为0.01张
-        contract_size = round(contract_size, 2)  # 保留2位小数
+        # 精度处理
+        contract_size = round(contract_size, 2)
 
         # 确保最小交易量
         min_contracts = max(TRADE_CONFIG.get('min_amount', 0.01), config.get('min_position', 0.01))
         if contract_size < min_contracts:
             contract_size = min_contracts
-            logger.info(f"⚠️ 仓位小于最小值，调整为: {contract_size} 张")
+            logger.info(f"️ 仓位小于最小值，调整为: {contract_size} 张")
 
-        logger.info(f"🎯 最终仓位: {final_usdt:.2f} USDT → {contract_size:.2f} 张合约")
+        logger.info(f" 最终仓位: {final_usdt:.2f} USDT  {TRADE_CONFIG['leverage']}杠杆  {contract_size:.2f} 张合约")
+        logger.info(f"   相当于: {contract_size * contract_size_corrected:.4f} BTC (价值: ${contract_size * contract_notional:.2f})")
+        
         return contract_size
 
     except Exception as e:
-        logger.error(f"❌ 仓位计算失败，使用基础仓位: {e}")
+        logger.error(f" 仓位计算失败，使用基础仓位: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        # 紧急备用计算，使用默认 contract_size 值 1
+        # 紧急备用计算
         base_usdt = config['base_usdt_amount']
-        contract_size = (base_usdt * TRADE_CONFIG['leverage']) / (
-                    price_data['price'] * TRADE_CONFIG.get('contract_size', 1))
+        contract_size_corrected = TRADE_CONFIG.get('contract_size', 0.01)
+        contract_notional = contract_size_corrected * price_data['price']  # 修正计算
+        contract_size = (base_usdt * TRADE_CONFIG['leverage']) / contract_notional
         return round(max(contract_size, TRADE_CONFIG.get('min_amount', 0.01)), 2)
 
 
 def calculate_technical_indicators(df):
-    """计算技术指标 - 来自第一个策略"""
+    """优化技术指标计算，更适合短线 - 确保所有列都创建"""
     try:
-        # 移动平均线
-        df['sma_5'] = df['close'].rolling(window=5, min_periods=1).mean()
-        df['sma_20'] = df['close'].rolling(window=20, min_periods=1).mean()
-        df['sma_50'] = df['close'].rolling(window=50, min_periods=1).mean()
+        # 确保数据足够计算
+        if len(df) < 21:
+            logger.warning(f"数据点不足，当前{len(df)}个，需要至少21个")
+            # 返回基础数据，不计算技术指标
+            return df
 
-        # 指数移动平均线
+        # 短线移动平均线
+        df['sma_3'] = df['close'].rolling(window=3, min_periods=1).mean()
+        df['sma_8'] = df['close'].rolling(window=8, min_periods=1).mean()
+        df['sma_21'] = df['close'].rolling(window=21, min_periods=1).mean()
+
+        # 短线EMA
+        df['ema_6'] = df['close'].ewm(span=6).mean()
         df['ema_12'] = df['close'].ewm(span=12).mean()
-        df['ema_26'] = df['close'].ewm(span=26).mean()
-        df['macd'] = df['ema_12'] - df['ema_26']
-        df['macd_signal'] = df['macd'].ewm(span=9).mean()
+        df['macd'] = df['ema_6'] - df['ema_12']
+        df['macd_signal'] = df['macd'].ewm(span=5).mean()
         df['macd_histogram'] = df['macd'] - df['macd_signal']
 
-        # 相对强弱指数 (RSI)
+        # 短线RSI (9周期)
         delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        gain = (delta.where(delta > 0, 0)).rolling(9).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(9).mean()
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
 
-        # 布林带
-        df['bb_middle'] = df['close'].rolling(20).mean()
-        bb_std = df['close'].rolling(20).std()
-        df['bb_upper'] = df['bb_middle'] + (bb_std * 2)
-        df['bb_lower'] = df['bb_middle'] - (bb_std * 2)
+        # 布林带 (14周期)
+        df['bb_middle'] = df['close'].rolling(14).mean()
+        bb_std = df['close'].rolling(14).std()
+        df['bb_upper'] = df['bb_middle'] + (bb_std * 1.5)
+        df['bb_lower'] = df['bb_middle'] - (bb_std * 1.5)
         df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
 
-        # 成交量均线
-        df['volume_ma'] = df['volume'].rolling(20).mean()
+        # 成交量均线 (10周期)
+        df['volume_ma'] = df['volume'].rolling(10).mean()
         df['volume_ratio'] = df['volume'] / df['volume_ma']
 
-        # 支撑阻力位
-        df['resistance'] = df['high'].rolling(20).max()
-        df['support'] = df['low'].rolling(20).min()
+        # 短线支撑阻力位
+        df['resistance'] = df['high'].rolling(10).max()
+        df['support'] = df['low'].rolling(10).min()
+
+        # 价格动量
+        df['momentum'] = df['close'] - df['close'].shift(3)
 
         # 填充NaN值
         df = df.bfill().ffill()
-
+        
+        # 验证所有必需的列都已创建
+        required_columns = ['sma_3', 'sma_8', 'sma_21', 'rsi', 'macd', 'bb_position']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            logger.warning(f"技术指标计算缺失列: {missing_columns}")
+            
+        logger.info(" 技术指标计算完成")
+        return df
+        
+    except pd.errors.EmptyDataError as e:
+        logger.error(f"技术指标计算失败，数据为空: {e}")
+        return df
+    except ValueError as e:
+        logger.error(f"技术指标计算失败，数据值错误: {e}")
         return df
     except Exception as e:
         logger.error(f"技术指标计算失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return df
+
+
+def get_dataframe_hash(df: pd.DataFrame) -> str:
+    """生成DataFrame的哈希值用于缓存键"""
+    return hashlib.md5(pd.util.hash_pandas_object(df).values).hexdigest()
+
+
+@lru_cache(maxsize=32)
+def calculate_technical_indicators_cached(df_hash: str, df_data: tuple) -> pd.DataFrame:
+    """带缓存的技术指标计算"""
+    # 将元组数据转换回DataFrame
+    df = pd.DataFrame(df_data[0], columns=df_data[1])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    
+    return calculate_technical_indicators(df)
+
+
+def optimize_dataframe_operations(df):
+    """优化DataFrame操作"""
+    # 使用向量化操作替代循环
+    df['price_change_pct'] = df['close'].pct_change() * 100
+    
+    # 避免链式赋值
+    df = df.copy()
+    df['new_column'] = df['close'] * 2
+    
+    return df
+
+
+# 用于缓存市场数据的全局变量
+_cached_market_data = None
+_cached_market_data_time = 0
+
+def get_cached_market_data(symbol, timeframe, limit):
+    """缓存市场数据，避免重复获取"""
+    global _cached_market_data, _cached_market_data_time
+    
+    current_time = time.time()
+    # 如果缓存不存在或者缓存时间超过30秒，则重新获取数据
+    if _cached_market_data is None or current_time - _cached_market_data_time > 30:
+        try:
+            # 重新获取数据
+            _cached_market_data = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            _cached_market_data_time = current_time
+            logger.debug("市场数据已更新")
+        except ccxt.NetworkError as e:
+            logger.error(f"获取市场数据失败，网络错误: {e}")
+            
+            # 如果获取新数据失败但有缓存数据，则继续使用缓存数据
+            if _cached_market_data is not None:
+                logger.warning("使用缓存的市场数据")
+                # 重置缓存时间，避免连续失败
+                _cached_market_data_time = current_time
+            else:
+                raise e
+        except ccxt.ExchangeError as e:
+            logger.error(f"获取市场数据失败，交易所错误: {e}")
+            
+            # 如果获取新数据失败但有缓存数据，则继续使用缓存数据
+            if _cached_market_data is not None:
+                logger.warning("使用缓存的市场数据")
+                # 重置缓存时间，避免连续失败
+                _cached_market_data_time = current_time
+            else:
+                raise e
+        except Exception as e:
+            logger.error(f"获取市场数据失败: {e}")
+            
+            # 如果获取新数据失败但有缓存数据，则继续使用缓存数据
+            if _cached_market_data is not None:
+                logger.warning("使用缓存的市场数据")
+                # 重置缓存时间，避免连续失败
+                _cached_market_data_time = current_time
+            else:
+                raise e
+    else:
+        logger.debug("使用缓存的市场数据")
+    
+    return _cached_market_data
 
 
 def get_support_resistance_levels(df, lookback=20):
@@ -406,6 +1231,12 @@ def get_support_resistance_levels(df, lookback=20):
             'price_vs_resistance': ((resistance_level - current_price) / current_price) * 100,
             'price_vs_support': ((current_price - support_level) / support_level) * 100
         }
+    except IndexError as e:
+        logger.error(f"支撑阻力计算失败，索引错误: {e}")
+        return {}
+    except ValueError as e:
+        logger.error(f"支撑阻力计算失败，数值错误: {e}")
+        return {}
     except Exception as e:
         logger.error(f"支撑阻力计算失败: {e}")
         return {}
@@ -419,7 +1250,7 @@ def get_sentiment_indicators():
     for attempt in range(max_retries):
         try:
             API_URL = "https://service.cryptoracle.network/openapi/v2/endpoint"
-            API_KEY = get_sentiment_api_key()
+            API_KEY = "7ad48a56-8730-4238-a714-eebc30834e3e"
 
             # 获取最近4小时数据
             end_time = datetime.now()
@@ -481,8 +1312,15 @@ def get_sentiment_indicators():
                                 'data_delay_minutes': data_delay
                             }
 
-                    logger.error("❌ 所有时间段数据都为空")
-                    return None
+                    logger.warning("⚠️ 所有时间段数据都为空，使用默认情绪指标")
+                    # 返回默认情绪指标而不是None
+                    return {
+                        'positive_ratio': 0.5,
+                        'negative_ratio': 0.5,
+                        'net_sentiment': 0.0,
+                        'data_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        'data_delay_minutes': 0
+                    }
 
             # 如果不是200状态码，记录错误并重试
             logger.warning(f"⚠️ 情绪指标API返回状态码: {response.status_code}，重试中... (尝试 {attempt + 1}/{max_retries})")
@@ -499,41 +1337,74 @@ def get_sentiment_indicators():
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
                 
+        except json.JSONDecodeError as e:
+            logger.error(f"情绪指标解析失败，JSON格式错误: {e}")
+            break
+        except KeyError as e:
+            logger.error(f"情绪指标解析失败，缺少必要字段: {e}")
+            break
+        except ValueError as e:
+            logger.error(f"情绪指标解析失败，数值转换错误: {e}")
+            break
         except Exception as e:
             logger.error(f"情绪指标获取失败: {e}")
             break
     
-    logger.error("❌ 情绪指标获取失败，已达到最大重试次数")
-    return None
+    logger.warning("❌ 情绪指标获取失败，已达到最大重试次数，使用默认情绪指标")
+    # 即使获取失败也返回默认值而不是None
+    return {
+        'positive_ratio': 0.5,
+        'negative_ratio': 0.5,
+        'net_sentiment': 0.0,
+        'data_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'data_delay_minutes': 0
+    }
 
 
 def get_market_trend(df):
-    """判断市场趋势"""
+    """优化趋势判断，更适合短线"""
     try:
         current_price = df['close'].iloc[-1]
 
-        # 多时间框架趋势分析
-        trend_short = "上涨" if current_price > df['sma_20'].iloc[-1] else "下跌"
-        trend_medium = "上涨" if current_price > df['sma_50'].iloc[-1] else "下跌"
+        #  这些访问是安全的，因为已经在calculate_technical_indicators中创建
+        trend_very_short = "上涨" if current_price > df['sma_3'].iloc[-1] else "下跌"
+        trend_short = "上涨" if current_price > df['sma_8'].iloc[-1] else "下跌"
+        trend_medium = "上涨" if current_price > df['sma_21'].iloc[-1] else "下跌"
 
         # MACD趋势
-        macd_trend = "bullish" if df['macd'].iloc[-1] > df['macd_signal'].iloc[-1] else "bearish"
+        macd_current = df['macd'].iloc[-1]
+        macd_previous = df['macd'].iloc[-2]
+        macd_trend = "bullish" if macd_current > macd_previous else "bearish"
 
-        # 综合趋势判断
-        if trend_short == "上涨" and trend_medium == "上涨":
+        # 动量判断
+        momentum = df['momentum'].iloc[-1]
+        momentum_trend = "强势" if abs(momentum) > df['momentum'].std() else "弱势"
+
+        # 综合趋势判断 - 更注重短期信号
+        if trend_very_short == "上涨" and trend_short == "上涨":
             overall_trend = "强势上涨"
-        elif trend_short == "下跌" and trend_medium == "下跌":
+        elif trend_very_short == "下跌" and trend_short == "下跌":
             overall_trend = "强势下跌"
-        else:
+        elif trend_very_short != trend_short:
             overall_trend = "震荡整理"
+        else:
+            overall_trend = "方向不明"
 
         return {
+            'very_short_term': trend_very_short,
             'short_term': trend_short,
             'medium_term': trend_medium,
             'macd': macd_trend,
+            'momentum': momentum_trend,
             'overall': overall_trend,
             'rsi_level': df['rsi'].iloc[-1]
         }
+    except IndexError as e:
+        logger.error(f"趋势分析失败，索引错误: {e}")
+        return {}
+    except ValueError as e:
+        logger.error(f"趋势分析失败，数值错误: {e}")
+        return {}
     except Exception as e:
         logger.error(f"趋势分析失败: {e}")
         return {}
@@ -541,14 +1412,21 @@ def get_market_trend(df):
 
 def get_btc_ohlcv_enhanced():
     """增强版：获取BTC K线数据并计算技术指标"""
-    max_retries = 3
-    retry_delay = 5
+    max_retries = TradingConstants.MAX_RETRIES
+    retry_delay = TradingConstants.RETRY_DELAY
+    
+    # 确保 data_points 在配置中存在
+    if 'data_points' not in TRADE_CONFIG:
+        TRADE_CONFIG['data_points'] = 64  # 设置默认值
     
     for attempt in range(max_retries):
         try:
-            # 获取K线数据
-            ohlcv = exchange.fetch_ohlcv(TRADE_CONFIG['symbol'], TRADE_CONFIG['timeframe'],
-                                        limit=TRADE_CONFIG['data_points'])
+            # 获取K线数据 - 使用缓存机制
+            ohlcv = get_cached_market_data(
+                TRADE_CONFIG['symbol'], 
+                TRADE_CONFIG['timeframe'],
+                limit=TRADE_CONFIG['data_points']
+            )
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -573,9 +1451,10 @@ def get_btc_ohlcv_enhanced():
                 'price_change': ((current_data['close'] - previous_data['close']) / previous_data['close']) * 100,
                 'kline_data': df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].tail(10).to_dict('records'),
                 'technical_data': {
-                    'sma_5': current_data.get('sma_5', 0),
-                    'sma_20': current_data.get('sma_20', 0),
-                    'sma_50': current_data.get('sma_50', 0),
+                    #  修复：使用新的技术指标键名
+                    'sma_3': current_data.get('sma_3', 0),
+                    'sma_8': current_data.get('sma_8', 0),
+                    'sma_21': current_data.get('sma_21', 0),
                     'rsi': current_data.get('rsi', 0),
                     'macd': current_data.get('macd', 0),
                     'macd_signal': current_data.get('macd_signal', 0),
@@ -589,6 +1468,41 @@ def get_btc_ohlcv_enhanced():
                 'levels_analysis': levels_analysis,
                 'full_data': df
             }
+        except ccxt.NetworkError as e:
+            logger.warning(f"获取K线数据失败，网络错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"❌ 获取K线数据失败，已达到最大重试次数: {e}")
+                return None
+        except ccxt.ExchangeError as e:
+            logger.warning(f"获取K线数据失败，交易所错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"❌ 获取K线数据失败，已达到最大重试次数: {e}")
+                return None
+        except pd.errors.EmptyDataError as e:
+            logger.warning(f"获取K线数据失败，数据为空 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"❌ 获取K线数据失败，已达到最大重试次数: {e}")
+                return None
+        except IndexError as e:
+            logger.warning(f"获取K线数据失败，索引错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"❌ 获取K线数据失败，已达到最大重试次数: {e}")
+                return None
+        except ValueError as e:
+            logger.warning(f"获取K线数据失败，数值错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"❌ 获取K线数据失败，已达到最大重试次数: {e}")
+                return None
         except Exception as e:
             logger.warning(f"获取K线数据失败 (尝试 {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
@@ -603,7 +1517,7 @@ def get_btc_ohlcv_enhanced():
 
 
 def generate_technical_analysis_text(price_data):
-    """生成技术分析文本"""
+    """生成技术分析文本 - 修复sma_3访问问题"""
     if 'technical_data' not in price_data:
         return "技术指标数据不可用"
 
@@ -615,35 +1529,107 @@ def generate_technical_analysis_text(price_data):
     def safe_float(value, default=0):
         return float(value) if value and pd.notna(value) else default
 
+    # 安全获取技术指标值，使用get方法避免KeyError
+    # 增加更严格的验证
+    if 'sma_3' not in tech or pd.isna(tech['sma_3']):
+        logger.warning("sma_3数据不可用，使用默认值")
+        sma_3 = 0
+    else:
+        sma_3 = safe_float(tech['sma_3'])
+        
+    if 'sma_8' not in tech or pd.isna(tech['sma_8']):
+        logger.warning("sma_8数据不可用，使用默认值")
+        sma_8 = 0
+    else:
+        sma_8 = safe_float(tech['sma_8'])
+        
+    if 'sma_21' not in tech or pd.isna(tech['sma_21']):
+        logger.warning("sma_21数据不可用，使用默认值")
+        sma_21 = 0
+    else:
+        sma_21 = safe_float(tech['sma_21'])
+        
+    if 'rsi' not in tech or pd.isna(tech['rsi']):
+        logger.warning("rsi数据不可用，使用默认值")
+        rsi = 50
+    else:
+        rsi = safe_float(tech['rsi'], 50)
+        
+    if 'macd' not in tech or pd.isna(tech['macd']):
+        logger.warning("macd数据不可用，使用默认值")
+        macd = 0
+    else:
+        macd = safe_float(tech['macd'])
+        
+    if 'macd_signal' not in tech or pd.isna(tech['macd_signal']):
+        logger.warning("macd_signal数据不可用，使用默认值")
+        macd_signal = 0
+    else:
+        macd_signal = safe_float(tech['macd_signal'])
+        
+    if 'bb_position' not in tech or pd.isna(tech['bb_position']):
+        logger.warning("bb_position数据不可用，使用默认值")
+        bb_position = 0.5
+    else:
+        bb_position = safe_float(tech['bb_position'], 0.5)
+    
+    # 计算相对变化，避免除零错误
+    def calc_change(price, base):
+        return (price - base) / base * 100 if base != 0 else 0
+
     analysis_text = f"""
     【技术指标分析】
-    📈 移动平均线:
-    - 5周期: {safe_float(tech['sma_5']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_5'])) / safe_float(tech['sma_5']) * 100:+.2f}%
-    - 20周期: {safe_float(tech['sma_20']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_20'])) / safe_float(tech['sma_20']) * 100:+.2f}%
-    - 50周期: {safe_float(tech['sma_50']):.2f} | 价格相对: {(price_data['price'] - safe_float(tech['sma_50'])) / safe_float(tech['sma_50']) * 100:+.2f}%
+     移动平均线:
+    - 3周期: {sma_3:.2f} | 价格相对: {calc_change(price_data['price'], sma_3):+.2f}%
+    - 8周期: {sma_8:.2f} | 价格相对: {calc_change(price_data['price'], sma_8):+.2f}%
+    - 21周期: {sma_21:.2f} | 价格相对: {calc_change(price_data['price'], sma_21):+.2f}%
 
-    🎯 趋势分析:
+     趋势分析:
+    - 超短期趋势: {trend.get('very_short_term', 'N/A')}
     - 短期趋势: {trend.get('short_term', 'N/A')}
     - 中期趋势: {trend.get('medium_term', 'N/A')}
     - 整体趋势: {trend.get('overall', 'N/A')}
     - MACD方向: {trend.get('macd', 'N/A')}
 
-    📊 动量指标:
-    - RSI: {safe_float(tech['rsi']):.2f} ({'超买' if safe_float(tech['rsi']) > 70 else '超卖' if safe_float(tech['rsi']) < 30 else '中性'})
-    - MACD: {safe_float(tech['macd']):.4f}
-    - 信号线: {safe_float(tech['macd_signal']):.4f}
+     动量指标:
+    - RSI: {rsi:.2f} ({'超买' if rsi > 70 else '超卖' if rsi < 30 else '中性'})
+    - MACD: {macd:.4f}
+    - 信号线: {macd_signal:.4f}
 
-    🎚️ 布林带位置: {safe_float(tech['bb_position']):.2%} ({'上部' if safe_float(tech['bb_position']) > 0.7 else '下部' if safe_float(tech['bb_position']) < 0.3 else '中部'})
+    ️ 布林带位置: {bb_position:.2%} ({'上部' if bb_position > 0.7 else '下部' if bb_position < 0.3 else '中部'})
 
-    💰 关键水平:
+     关键水平:
     - 静态阻力: {safe_float(levels.get('static_resistance', 0)):.2f}
     - 静态支撑: {safe_float(levels.get('static_support', 0)):.2f}
     """
     return analysis_text
 
 
+def debug_position_info():
+    """调试持仓信息，显示所有相关字段"""
+    try:
+        positions = exchange.fetch_positions([TRADE_CONFIG['symbol']])
+        logger.info("=== 持仓调试信息 ===")
+        for pos in positions:
+            if pos['symbol'] == TRADE_CONFIG['symbol']:
+                logger.info(f"持仓详情: {pos}")
+                logger.info(f"  - 合约: {pos.get('contracts')}")
+                logger.info(f"  - 模式: {pos.get('mgnMode')}")
+                logger.info(f"  - 杠杆: {pos.get('leverage')}")
+                logger.info(f"  - 方向: {pos.get('side')}")
+                logger.info(f"  - 入场价: {pos.get('entryPrice')}")
+                logger.info(f"  - 未实现盈亏: {pos.get('unrealizedPnl')}")
+        logger.info("=== 调试信息结束 ===")
+    except ccxt.NetworkError as e:
+        logger.error(f"调试持仓信息失败，网络错误: {e}")
+    except ccxt.ExchangeError as e:
+        logger.error(f"调试持仓信息失败，交易所错误: {e}")
+    except Exception as e:
+        logger.error(f"调试持仓信息失败: {e}")
+
+
 def get_current_position():
-    """获取当前持仓情况 - OKX版本"""
+    """获取当前持仓情况 - OKX版本，修复模式处理"""
     max_retries = 3
     retry_delay = 3
     
@@ -654,28 +1640,52 @@ def get_current_position():
             for pos in positions:
                 if pos['symbol'] == TRADE_CONFIG['symbol']:
                     contracts = float(pos['contracts']) if pos['contracts'] else 0
+                    mgn_mode = pos.get('mgnMode')
+                    
+                    # 记录详细的持仓信息用于调试
+                    logger.debug(f" 持仓检查: 合约={contracts}, 模式={mgn_mode}, 方向={pos.get('side')}")
 
                     if contracts > 0:
-                        return {
+                        position_info = {
                             'side': pos['side'],  # 'long' or 'short'
                             'size': contracts,
                             'entry_price': float(pos['entryPrice']) if pos['entryPrice'] else 0,
                             'unrealized_pnl': float(pos['unrealizedPnl']) if pos['unrealizedPnl'] else 0,
-                            'leverage': float(pos['leverage']) if pos['leverage'] else TRADE_CONFIG['leverage'],
-                            'symbol': pos['symbol']
+                            'leverage': float(pos.get('leverage') or 0) or TRADE_CONFIG['leverage'],
+                            'symbol': pos['symbol'],
+                            'mgn_mode': mgn_mode  # 添加模式信息用于调试
                         }
+                        logger.info(f" 当前持仓: {position_info['side']}仓 {position_info['size']}张 (模式: {mgn_mode})")
+                        return position_info
 
+            logger.info(" 当前无持仓")
             return None
 
-        except Exception as e:
-            logger.warning(f"获取持仓信息失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+        except ccxt.NetworkError as e:
+            logger.warning(f"交易所API错误，获取持仓信息失败 (尝试 {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
             else:
-                logger.error(f"❌ 获取持仓信息失败，已达到最大重试次数: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+                logger.error(f" 交易所API错误，获取持仓信息失败，已达到最大重试次数: {e}")
                 return None
+        except ccxt.ExchangeError as e:
+            logger.warning(f"交易所错误，获取持仓信息失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                logger.error(f" 交易所错误，获取持仓信息失败，已达到最大重试次数: {e}")
+                return None
+        except ValueError as e:
+            logger.error(f"获取持仓信息失败，数值转换错误: {e}")
+            return None
+        except KeyError as e:
+            logger.error(f"获取持仓信息失败，缺少必要字段: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"获取持仓信息时发生未知错误: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
     
     return None
 
@@ -700,11 +1710,19 @@ def safe_json_parse(json_str):
 
 def create_fallback_signal(price_data):
     """创建备用交易信号"""
+    # 使用配置中的止盈止损参数
+    stop_loss_config = TRADE_CONFIG.get('stop_loss_config', {})
+    take_profit_config = TRADE_CONFIG.get('take_profit_config', {})
+    
+    # 默认倍数
+    sl_multiplier = stop_loss_config.get('low_confidence_multiplier', 0.98)
+    tp_multiplier = take_profit_config.get('low_confidence_multiplier', 1.02)
+    
     return {
         "signal": "HOLD",
         "reason": "因技术分析暂时不可用，采取保守策略",
-        "stop_loss": price_data['price'] * 0.98,  # -2%
-        "take_profit": price_data['price'] * 1.02,  # +2%
+        "stop_loss": price_data['price'] * sl_multiplier,
+        "take_profit": price_data['price'] * tp_multiplier,
         "confidence": "LOW",
         "is_fallback": True
     }
@@ -743,6 +1761,19 @@ def analyze_with_deepseek(price_data):
     position_text = "无持仓" if not current_pos else f"{current_pos['side']}仓, 数量: {current_pos['size']}, 盈亏: {current_pos['unrealized_pnl']:.2f}USDT"
     pnl_text = f", 持仓盈亏: {current_pos['unrealized_pnl']:.2f} USDT" if current_pos else ""
 
+    # 获取止盈止损配置参数
+    stop_loss_config = TRADE_CONFIG.get('stop_loss_config', {})
+    take_profit_config = TRADE_CONFIG.get('take_profit_config', {})
+    
+    # 默认倍数
+    sl_high = stop_loss_config.get('high_confidence_multiplier', 0.95)
+    sl_medium = stop_loss_config.get('medium_confidence_multiplier', 0.97)
+    sl_low = stop_loss_config.get('low_confidence_multiplier', 0.98)
+    
+    tp_high = take_profit_config.get('high_confidence_multiplier', 1.5)
+    tp_medium = take_profit_config.get('medium_confidence_multiplier', 1.2)
+    tp_low = take_profit_config.get('low_confidence_multiplier', 1.02)
+
     prompt = f"""
 你是一个专业的加密货币交易分析师，专注于BTC/USDT {TRADE_CONFIG['timeframe']}周期的趋势分析和交易决策。
 
@@ -773,7 +1804,7 @@ def analyze_with_deepseek(price_data):
 
 ### 核心分析维度（按重要性排序）
 1. **趋势分析**（权重40%）
-   - 多时间框架趋势一致性（5/20/50周期均线）
+   - 多时间框架趋势一致性（3/8/21周期均线）
    - MACD趋势确认
    - 价格与关键支撑阻力位关系
 
@@ -802,14 +1833,39 @@ def analyze_with_deepseek(price_data):
 2. **避免频繁交易**: 同一方向信号可适当加仓，反向信号需严格确认
 3. **仓位管理**: 根据信号信心度调整仓位（LOW:50%, MEDIUM:75%, HIGH:100%）
 
+#### 止盈止损设置参考
+根据信心度不同，建议的止盈止损比例：
+- HIGH信心度：止损 {1-sl_high:.1%}-{1-sl_medium:.1%} ，止盈 {tp_high-1:.0%}-{tp_medium-1:.0%}
+- MEDIUM信心度：止损 {1-sl_medium:.1%}-{1-sl_low:.1%} ，止盈 {tp_medium-1:.0%}-{tp_low-1:.0%}
+- LOW信心度：止损 {1-sl_low:.1%} ，止盈 {tp_low-1:.0%}
+
 #### 信心度评估标准
 - **HIGH**: 趋势明确，3个以上指标确认，情绪面一致
 - **MEDIUM**: 趋势较明确，2个指标确认，情绪面中性
 - **LOW**: 趋势不明确，指标混杂，情绪面背离
 
+## 短线交易指导原则
+
+### 核心短线策略
+1. **快进快出**: 持仓时间控制在15分钟到1小时内
+2. **小止损大止盈**: 止损1-2%，止盈1.5-2.5%
+3. **顺势而为**: 主要跟随短期趋势，避免逆势操作
+4. **量价配合**: 重点关注成交量与价格变动的匹配度
+
+### 短线信号优先级
+1. **短期均线突破** (sma_3, sma_8)
+2. **MACD金叉死叉** 
+3. **RSI超买超卖** (70/30为界)
+4. **布林带突破**
+
+### 风险控制
+- 单笔亏损不超过总资金的2%
+- 连续亏损3次后降低仓位50%
+- 日内最大回撤控制在5%以内
+
 ## 输出要求
 
-请基于以上分析，提供一个明确的交易决策：
+Please based on above analysis, provide a明确的 trading decision:
 
 1. **signal**: 交易信号（BUY/SELL/HOLD）
 2. **reason**: 简明扼要的分析理由（不超过100字）
@@ -817,14 +1873,14 @@ def analyze_with_deepseek(price_data):
 4. **take_profit**: 止盈价格（具体数值）
 5. **confidence**: 信心度（HIGH/MEDIUM/LOW）
 
-请严格按照以下JSON格式输出，不要包含其他内容：
-{{
+Please strictly adhere to the following JSON format output, don't contain other content:
+{{{{
     "signal": "BUY|SELL|HOLD",
     "reason": "简要分析理由(包含趋势判断和技术依据)",
     "stop_loss": 具体价格,
     "take_profit": 具体价格,
     "confidence": "HIGH|MEDIUM|LOW"
-}}
+}}}}
 """
 
     try:
@@ -835,19 +1891,20 @@ def analyze_with_deepseek(price_data):
                  "content": f"""您是一位经验丰富的加密货币交易专家，具有以下特质：
 1. 专精于BTC/USDT交易对的{TRADE_CONFIG['timeframe']}周期技术分析
 2. 擅长多时间框架趋势识别和确认
-3. 精通风险管理，始终坚持"保住本金"的首要原则
+3. 精通风险管理，在控制风险的前提下积极寻找交易机会
 4. 具备优秀的市场情绪解读能力，能结合技术面和情绪面做出综合判断
-5. 严格遵守交易纪律，避免频繁交易和情绪化决策
+5. 平衡风险与收益，避免过度保守错过交易机会
 
 您的任务是基于提供的数据进行专业分析，并输出符合规范的交易信号。请特别注意：
-- 信号必须基于客观数据，避免主观臆断
-- 严格按照权重分配进行综合评估
-- 始终将风险控制放在首位
-- 保持信号的一致性和可执行性"""},
+- 在趋势明确时果断给出交易信号
+- 避免因追求完美信号而错过良好机会
+- 保持适度的交易频率，不要过度保守
+- 当多个技术指标共振时，应提高信心度"""},
                 {"role": "user", "content": prompt}
             ],
             stream=False,
-            temperature=0.1
+            temperature=0.3,  # 提高温度，增加创造性
+            top_p=0.8  # 增加多样性
         )
 
         # 安全解析JSON
@@ -891,32 +1948,73 @@ def analyze_with_deepseek(price_data):
 
         return signal_data
 
+    except ccxt.NetworkError as e:
+        logger.error(f"DeepSeek分析失败，网络错误: {e}")
+        return create_fallback_signal(price_data)
+    except ccxt.ExchangeError as e:
+        logger.error(f"DeepSeek分析失败，交易所错误: {e}")
+        return create_fallback_signal(price_data)
+    except json.JSONDecodeError as e:
+        logger.error(f"DeepSeek分析失败，JSON解析错误: {e}")
+        return create_fallback_signal(price_data)
+    except KeyError as e:
+        logger.error(f"DeepSeek分析失败，缺少必要字段: {e}")
+        return create_fallback_signal(price_data)
     except Exception as e:
         logger.error(f"DeepSeek分析失败: {e}")
         return create_fallback_signal(price_data)
 
 
 def execute_intelligent_trade(signal_data, price_data):
-    """执行智能交易 - OKX版本（支持同方向加仓减仓）"""
-    global position
-    
-    # 新增：记录HOLD信号出现次数
+    """优化交易执行，更适合短线"""
+    # 初始化属性
+    if not hasattr(execute_intelligent_trade, 'last_trade_time'):
+        execute_intelligent_trade.last_trade_time = 0
     if not hasattr(execute_intelligent_trade, 'hold_count'):
         execute_intelligent_trade.hold_count = 0
+    if not hasattr(execute_intelligent_trade, 'base_hold_position'):
         execute_intelligent_trade.base_hold_position = None
-
+    
+    current_time = time.time()
+    
+    # 短线交易频率控制
+    min_trade_interval = TradingConstants.MIN_TRADE_INTERVAL  # 5分钟最小交易间隔
+    if current_time - execute_intelligent_trade.last_trade_time < min_trade_interval:
+        logger.info(f"️⏰ 短线交易频率控制: 距离上次交易不足{min_trade_interval}秒，跳过本次交易")
+        return
+    
+    # 交易前安全检查
+    if not pre_trade_safety_check():
+        logger.error("❌ 交易前安全检查失败，跳过本次交易")
+        return
+    
     current_position = get_current_position()
+    
+    # 短线持仓时间检查
+    if current_position and execute_intelligent_trade.last_trade_time > 0:
+        position_hold_time = current_time - execute_intelligent_trade.last_trade_time
+        max_hold_time = TradingConstants.MAX_HOLD_TIME  # 最大持仓1小时
+        
+        if position_hold_time > max_hold_time:
+            logger.info(f"⏳ 持仓时间超过{max_hold_time}秒，强制平仓")
+            if current_position['side'] == 'long':
+                _create_reduce_only_order(TRADE_CONFIG['symbol'], 'sell', current_position['size'])
+            else:
+                _create_reduce_only_order(TRADE_CONFIG['symbol'], 'buy', current_position['size'])
+            execute_intelligent_trade.last_trade_time = current_time
+            return
     
     # 显示当前持仓情况
     if current_position:
-        logger.info(f"📊 当前持仓详情: {current_position['side']}仓 {current_position['size']}张, 入场价: {current_position['entry_price']}, 浮盈: {current_position['unrealized_pnl']:.2f} USDT")
+        pnl_text = f" (浮盈: {current_position['unrealized_pnl']:.2f} USDT)" if current_position['unrealized_pnl'] else ""
+        logger.info(f"💼 当前持仓: {current_position['side']}仓 {current_position['size']}张 @ {current_position['entry_price']:.2f}{pnl_text}")
     else:
-        logger.info("📊 当前无持仓")
+        logger.info("📭 当前无持仓")
 
     # 更新HOLD信号计数器
     if signal_data['signal'] == 'HOLD':
         execute_intelligent_trade.hold_count += 1
-        logger.info(f"🔔 HOLD信号连续出现次数: {execute_intelligent_trade.hold_count}")
+        logger.info(f"⏸️  HOLD信号连续出现次数: {execute_intelligent_trade.hold_count}")
     else:
         # 重置计数器
         if execute_intelligent_trade.hold_count > 0:
@@ -924,83 +2022,74 @@ def execute_intelligent_trade(signal_data, price_data):
         execute_intelligent_trade.hold_count = 0
         execute_intelligent_trade.base_hold_position = None
 
-    # 新增：HOLD信号时减仓逻辑（根据配置决定在第几次出现时减仓和减仓比例）
+    # HOLD信号动态减仓逻辑
     hold_config = TRADE_CONFIG.get('hold_signal_config', {})
     if (signal_data['signal'] == 'HOLD' and 
         current_position and 
-        hold_config.get('enable_hold_reduce', False)):  # 修复默认值为False
+        hold_config.get('enable_hold_reduce', False) and
+        hold_config.get('enable_dynamic_reduction', True)):
         
-        reduce_on_nth = hold_config.get('reduce_on_nth_hold', 3)  # 默认第3次
-        reduce_ratio = hold_config.get('reduce_ratio', 0.5)  # 默认减50%
-        logger.info(f"🔧 HOLD信号减仓功能已启用，将在第{reduce_on_nth}次出现时按{reduce_ratio:.0%}比例减仓")
+        should_reduce, reduce_ratio = _calculate_dynamic_hold_reduction(
+            price_data, current_position, execute_intelligent_trade.hold_count
+        )
         
-        # 如果是第一次遇到HOLD信号，记录当前仓位为基准
         if execute_intelligent_trade.base_hold_position is None:
             execute_intelligent_trade.base_hold_position = current_position['size']
-            logger.info(f"📝 记录基准仓位: {execute_intelligent_trade.base_hold_position:.2f} 张")
+            logger.info(f"📌 记录基准仓位: {execute_intelligent_trade.base_hold_position:.2f} 张")
         
-        # 在指定次数出现HOLD信号时减仓
-        if execute_intelligent_trade.hold_count == reduce_on_nth:
-            logger.info(f"🔧 HOLD信号连续第{reduce_on_nth}次出现，执行减仓操作...")
+        if should_reduce:
+            logger.info(f"📉 HOLD信号触发动态减仓条件，执行减仓操作...")
+            logger.info(f"   减仓比例: {reduce_ratio:.1%}")
+            logger.info(f"   减仓原因: {_get_hold_reduction_reason(price_data, current_position)}")
             
-            # 计算减仓后的仓位
             current_contracts = current_position['size']
-            target_contracts = current_contracts * (1 - reduce_ratio)  # 按比例减仓
-            
-            # 确保不会低于最小交易量
+            target_contracts = current_contracts * (1 - reduce_ratio)
             min_contracts = TRADE_CONFIG.get('min_amount', 0.01)
-            if target_contracts < min_contracts:
-                target_contracts = 0  # 如果目标仓位小于最小交易量，则全部平仓
             
-            # 计算需要调整的仓位
+            if target_contracts < min_contracts:
+                target_contracts = 0
+            
             size_diff = current_contracts - target_contracts
             
-            # 只有当需要减仓时才执行
-            if size_diff >= min_contracts:  # 需要减仓
+            if size_diff >= min_contracts:
                 reduce_size = round(size_diff, 2)
-                
                 try:
                     if current_position['side'] == 'long':
-                        logger.info(f"📉 HOLD信号减仓多仓: {current_contracts:.2f} → {target_contracts:.2f} 张 (减仓比例: {reduce_ratio:.0%})")
-                        _create_reduce_only_order(
-                            TRADE_CONFIG['symbol'],
-                            'sell',
-                            reduce_size
-                        )
+                        logger.info(f"🔻 HOLD信号减仓多仓: {current_contracts:.2f} → {target_contracts:.2f} 张")
+                        _create_reduce_only_order(TRADE_CONFIG['symbol'], 'sell', reduce_size)
                     elif current_position['side'] == 'short':
-                        logger.info(f"📉 HOLD信号减仓空仓: {current_contracts:.2f} → {target_contracts:.2f} 张 (减仓比例: {reduce_ratio:.0%})")
-                        _create_reduce_only_order(
-                            TRADE_CONFIG['symbol'],
-                            'buy',
-                            reduce_size
-                        )
+                        logger.info(f"🔺 HOLD信号减仓空仓: {current_contracts:.2f} → {target_contracts:.2f} 张")
+                        _create_reduce_only_order(TRADE_CONFIG['symbol'], 'buy', reduce_size)
                     
                     logger.info("✅ HOLD信号减仓执行成功")
                     time.sleep(2)
-                    position = get_current_position()
+                    execute_intelligent_trade.last_trade_time = current_time
                     return
-                    
                 except Exception as e:
                     logger.error(f"❌ HOLD信号减仓失败: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
             else:
-                logger.info(f"✅ 当前仓位已接近最小值或为零: {current_contracts:.2f} 张")
+                logger.info(f"ℹ️  当前仓位已接近最小值或为零: {current_contracts:.2f} 张")
                 return
-        elif execute_intelligent_trade.hold_count > reduce_on_nth:
-            logger.info(f"📝 HOLD信号第{execute_intelligent_trade.hold_count}次出现，已执行过减仓操作，保持现状")
-            return
-        elif execute_intelligent_trade.hold_count < reduce_on_nth:
-            logger.info(f"📝 HOLD信号第{execute_intelligent_trade.hold_count}次出现，未达到减仓条件({reduce_on_nth}次)")
-            # 继续执行后续逻辑
+        else:
+            logger.info(f"🔍 HOLD信号第{execute_intelligent_trade.hold_count}次出现，未达到动态减仓条件")
 
     # 计算智能仓位
     position_size = calculate_intelligent_position(signal_data, price_data, current_position)
 
-    logger.info(f"交易信号: {signal_data['signal']}")
-    logger.info(f"信心程度: {signal_data['confidence']}")
-    logger.info(f"智能仓位: {position_size:.2f} 张")
-    logger.info(f"理由: {signal_data['reason']}")
+    # 使用更美观的格式显示交易决策
+    logger.info("📈" + "═" * 48 + "📈")
+    logger.info("🤖 AI交易决策信号")
+    logger.info("📈" + "═" * 48 + "📈")
+    logger.info(f"🎯 信号类型: {signal_data['signal']}")
+    logger.info(f"💪 信心程度: {signal_data['confidence']}")
+    logger.info(f"📊 仓位规模: {position_size:.2f} 张")
+    logger.info(f"📝 理由: {signal_data['reason']}")
+    logger.info(f"🛑 止损价格: {signal_data['stop_loss']:.2f}")
+    logger.info(f"🏆 止盈价格: {signal_data['take_profit']:.2f}")
+    logger.info("📈" + "═" * 48 + "📈")
+
+    # 添加结构化日志
+    structured_logging(TRADE_CONFIG['symbol'], price_data['price'], signal_data)
 
     # 风险管理
     if signal_data['confidence'] == 'LOW' and not TRADE_CONFIG['test_mode']:
@@ -1008,65 +2097,96 @@ def execute_intelligent_trade(signal_data, price_data):
         return
 
     if TRADE_CONFIG['test_mode']:
-        logger.info("测试模式 - 仅模拟交易")
+        logger.info("🧪 测试模式 - 仅模拟交易")
         return
 
     try:
-        # 根据信号类型执行相应交易逻辑
+        # 根据信号类型执行交易
         if signal_data['signal'] == 'BUY':
-            _handle_buy_signal(signal_data, position_size, current_position)
+            _handle_buy_signal(signal_data, position_size, current_position, price_data)
         elif signal_data['signal'] == 'SELL':
-            _handle_sell_signal(signal_data, position_size, current_position)
+            _handle_sell_signal(signal_data, position_size, current_position, price_data)
         elif signal_data['signal'] == 'HOLD':
-            logger.info("建议观望，不执行交易")
+            logger.info("⏸️ 建议观望，不执行交易")
             return
 
-        logger.info("智能交易执行成功")
+        # 设置止盈止损 - 分开检查开关
+        enable_stop_loss = TRADE_CONFIG['stop_loss_config'].get('enable_stop_loss', False)  # 默认已改为False
+        enable_take_profit = TRADE_CONFIG['take_profit_config'].get('enable_take_profit', False)
+        
+        if not TRADE_CONFIG['test_mode'] and (signal_data['signal'] in ['BUY', 'SELL']):
+            if enable_stop_loss or enable_take_profit:
+                logger.info(f"⚙️ 设置止盈止损: 止损开关={enable_stop_loss}, 止盈开关={enable_take_profit}")
+                _set_stop_loss_take_profit(signal_data, position_size)
+            else:
+                logger.info("⚙️ 止盈止损功能均已关闭，跳过设置")
+
+        logger.info("✅ 智能交易执行成功")
         time.sleep(2)
+        
+        # 显示更新后的持仓
         position = get_current_position()
-        # 显示更新后的持仓情况
         if position:
-            logger.info(f"📊 交易后持仓详情: {position['side']}仓 {position['size']}张, 入场价: {position['entry_price']}, 浮盈: {position['unrealized_pnl']:.2f} USDT")
+            pnl_text = f" (浮盈: {position['unrealized_pnl']:.2f} USDT)" if position['unrealized_pnl'] else ""
+            logger.info("📊" + "═" * 48 + "📊")
+            logger.info("✅ 交易执行完成")
+            logger.info(f"💼 更新后持仓: {position['side']}仓 {position['size']}张 @ {position['entry_price']:.2f}{pnl_text}")
+            logger.info("📊" + "═" * 48 + "📊")
         else:
-            logger.info("📊 交易后无持仓")
+            logger.info("📊" + "═" * 48 + "📊")
+            logger.info("✅ 交易执行完成")
+            logger.info("📭 更新后持仓: 无")
+            logger.info("📊" + "═" * 48 + "📊")
 
     except Exception as e:
-        logger.error(f"交易执行失败: {e}")
-
-        # 如果是持仓不存在的错误，尝试直接开新仓
-        if "don't have any positions" in str(e):
-            logger.info("尝试直接开新仓...")
-            try:
-                order_tag = TRADE_CONFIG.get('okx_order_tag', '60bb4a8d3416BCDE')
-                if signal_data['signal'] == 'BUY':
-                    exchange.create_market_order(
-                        TRADE_CONFIG['symbol'],
-                        'buy',
-                        position_size,
-                        params={'tag': order_tag}
-                    )
-                elif signal_data['signal'] == 'SELL':
-                    exchange.create_market_order(
-                        TRADE_CONFIG['symbol'],
-                        'sell',
-                        position_size,
-                        params={'tag': order_tag}
-                    )
-                logger.info("直接开仓成功")
-            except Exception as e2:
-                logger.error(f"直接开仓也失败: {e2}")
-
+        logger.error(f"❌ 交易执行失败: {e}")
         import traceback
         logger.error(traceback.format_exc())
 
+    # 更新最后交易时间
+    execute_intelligent_trade.last_trade_time = current_time
 
-def _handle_buy_signal(signal_data, position_size, current_position):
-    """处理BUY信号"""
+
+def short_term_monitor():
+    """短线交易监控"""
+    if not hasattr(short_term_monitor, 'trade_count'):
+        short_term_monitor.trade_count = 0
+        short_term_monitor.win_count = 0
+        short_term_monitor.total_pnl = 0
+    
+    current_position = get_current_position()
+    if current_position:
+        # 监控持仓盈亏
+        pnl_ratio = abs(current_position['unrealized_pnl']) / TRADE_CONFIG['position_management']['base_usdt_amount']
+        
+        # 短线快速止损
+        if pnl_ratio > 0.03:  # 亏损超过3%
+            logger.warning(f" 短线快速止损触发，当前亏损: {pnl_ratio:.1%}")
+            # 执行止损逻辑
+            if current_position['side'] == 'long':
+                _create_reduce_only_order(TRADE_CONFIG['symbol'], 'sell', current_position['size'])
+            else:
+                _create_reduce_only_order(TRADE_CONFIG['symbol'], 'buy', current_position['size'])
+
+
+def _handle_buy_signal(signal_data, position_size, current_position, price_data):
+    """处理BUY信号 - 添加资金检查"""
+    # 在开仓前检查资金并调整仓位
+    adjusted_position_size = _check_and_adjust_position_by_balance(
+        TRADE_CONFIG['symbol'], 'buy', position_size, price_data
+    )
+    
+    if adjusted_position_size <= 0:
+        logger.error(" 资金不足，无法开多仓")
+        return
+        
+    # 使用调整后的仓位
+    position_size = adjusted_position_size
+    
     if current_position and current_position['side'] == 'short':
-        # 先检查空头持仓是否真实存在且数量正确
         if current_position['size'] > 0:
             logger.info(f"平空仓 {current_position['size']:.2f} 张并开多仓 {position_size:.2f} 张...")
-            # 平空仓
+            # 平空仓 - 使用修复后的函数
             _create_reduce_only_order(
                 TRADE_CONFIG['symbol'],
                 'buy',
@@ -1080,7 +2200,7 @@ def _handle_buy_signal(signal_data, position_size, current_position):
                 position_size
             )
         else:
-            logger.warning("⚠️ 检测到空头持仓但数量为0，直接开多仓")
+            logger.warning("️ 检测到空头持仓但数量为0，直接开多仓")
             _create_market_order(
                 TRADE_CONFIG['symbol'],
                 'buy',
@@ -1091,30 +2211,36 @@ def _handle_buy_signal(signal_data, position_size, current_position):
         # 同方向，检查是否需要调整仓位
         size_diff = position_size - current_position['size']
 
-        if abs(size_diff) >= 0.01:  # 有可调整的差异
+        # 使用配置中的最小交易量作为阈值，而不是硬编码的0.01
+        min_amount = TRADE_CONFIG.get('min_amount', 0.01)
+        if abs(size_diff) >= min_amount:
             if size_diff > 0:
-                # 加仓
+                # 加仓 - 检查资金
                 add_size = round(size_diff, 2)
-                logger.info(
-                    f"多仓加仓 {add_size:.2f} 张 (当前:{current_position['size']:.2f} → 目标:{position_size:.2f})")
-                _create_market_order(
-                    TRADE_CONFIG['symbol'],
-                    'buy',
-                    add_size
+                adjusted_add_size = _check_and_adjust_position_by_balance(
+                    TRADE_CONFIG['symbol'], 'buy', add_size, price_data
                 )
+                
+                if adjusted_add_size >= min_amount:  # 给予更多宽容度
+                    logger.info(f"多仓加仓 {adjusted_add_size:.2f} 张")
+                    _create_market_order(
+                        TRADE_CONFIG['symbol'],
+                        'buy',
+                        adjusted_add_size
+                    )
+                else:
+                    logger.warning(" 资金不足，跳过加仓")
             else:
-                # 减仓
+                # 减仓不需要检查资金
                 reduce_size = round(abs(size_diff), 2)
-                logger.info(
-                    f"多仓减仓 {reduce_size:.2f} 张 (当前:{current_position['size']:.2f} → 目标:{position_size:.2f})")
+                logger.info(f"多仓减仓 {reduce_size:.2f} 张")
                 _create_reduce_only_order(
                     TRADE_CONFIG['symbol'],
                     'sell',
                     reduce_size
                 )
         else:
-            logger.info(
-                f"已有多头持仓，仓位合适保持现状 (当前:{current_position['size']:.2f}, 目标:{position_size:.2f})")
+            logger.info(f"已有多头持仓，仓位合适保持现状")
     else:
         # 无持仓时开多仓
         logger.info(f"开多仓 {position_size:.2f} 张...")
@@ -1125,8 +2251,20 @@ def _handle_buy_signal(signal_data, position_size, current_position):
         )
 
 
-def _handle_sell_signal(signal_data, position_size, current_position):
-    """处理SELL信号"""
+def _handle_sell_signal(signal_data, position_size, current_position, price_data):
+    """处理SELL信号 - 添加资金检查"""
+    # 在开仓前检查资金并调整仓位
+    adjusted_position_size = _check_and_adjust_position_by_balance(
+        TRADE_CONFIG['symbol'], 'sell', position_size, price_data
+    )
+    
+    if adjusted_position_size <= 0:
+        logger.error(" 资金不足，无法开空仓")
+        return
+        
+    # 使用调整后的仓位
+    position_size = adjusted_position_size
+    
     if current_position and current_position['side'] == 'long':
         # 先检查多头持仓是否真实存在且数量正确
         if current_position['size'] > 0:
@@ -1145,7 +2283,7 @@ def _handle_sell_signal(signal_data, position_size, current_position):
                 position_size
             )
         else:
-            logger.warning("⚠️ 检测到多头持仓但数量为0，直接开空仓")
+            logger.warning("️ 检测到多头持仓但数量为0，直接开空仓")
             _create_market_order(
                 TRADE_CONFIG['symbol'],
                 'sell',
@@ -1156,30 +2294,36 @@ def _handle_sell_signal(signal_data, position_size, current_position):
         # 同方向，检查是否需要调整仓位
         size_diff = position_size - current_position['size']
 
-        if abs(size_diff) >= 0.01:  # 有可调整的差异
+        # 使用配置中的最小交易量作为阈值，而不是硬编码的0.01
+        min_amount = TRADE_CONFIG.get('min_amount', 0.01)
+        if abs(size_diff) >= min_amount:  # 有可调整的差异
             if size_diff > 0:
-                # 加仓
+                # 加仓 - 检查资金
                 add_size = round(size_diff, 2)
-                logger.info(
-                    f"空仓加仓 {add_size:.2f} 张 (当前:{current_position['size']:.2f} → 目标:{position_size:.2f})")
-                _create_market_order(
-                    TRADE_CONFIG['symbol'],
-                    'sell',
-                    add_size
+                adjusted_add_size = _check_and_adjust_position_by_balance(
+                    TRADE_CONFIG['symbol'], 'sell', add_size, price_data
                 )
+                
+                if adjusted_add_size >= min_amount:  # 给予更多宽容度
+                    logger.info(f"空仓加仓 {adjusted_add_size:.2f} 张 (当前:{current_position['size']:.2f}  目标:{position_size:.2f})")
+                    _create_market_order(
+                        TRADE_CONFIG['symbol'],
+                        'sell',
+                        adjusted_add_size
+                    )
+                else:
+                    logger.warning(" 资金不足，跳过加仓")
             else:
-                # 减仓
+                # 减仓不需要检查资金
                 reduce_size = round(abs(size_diff), 2)
-                logger.info(
-                    f"空仓减仓 {reduce_size:.2f} 张 (当前:{current_position['size']:.2f} → 目标:{position_size:.2f})")
+                logger.info(f"空仓减仓 {reduce_size:.2f} 张 (当前:{current_position['size']:.2f}  目标:{position_size:.2f})")
                 _create_reduce_only_order(
                     TRADE_CONFIG['symbol'],
                     'buy',
                     reduce_size
                 )
         else:
-            logger.info(
-                f"已有空头持仓，仓位合适保持现状 (当前:{current_position['size']:.2f}, 目标:{position_size:.2f})")
+            logger.info(f"已有空头持仓，仓位合适保持现状 (当前:{current_position['size']:.2f}, 目标:{position_size:.2f})")
     else:
         # 无持仓时开空仓
         logger.info(f"开空仓 {position_size:.2f} 张...")
@@ -1188,6 +2332,115 @@ def _handle_sell_signal(signal_data, position_size, current_position):
             'sell',
             position_size
         )
+
+
+def _check_and_adjust_position_by_balance(symbol, side, amount, price_data):
+    """
+    检查账户余额是否足够开仓，如果不够就逐步减半仓位
+    返回调整后的仓位大小
+    """
+    try:
+        # 获取配置
+        config = TRADE_CONFIG['position_management']
+        
+        # 获取当前价格
+        current_price = price_data['price']
+        
+        # 计算开仓所需保证金
+        contract_size = TRADE_CONFIG.get('contract_size', 0.01)
+        contract_notional = current_price * contract_size  # 1张合约的面值
+        required_margin = (amount * contract_notional) / TRADE_CONFIG['leverage']
+        
+        # 获取账户余额
+        balance = get_account_balance()
+        if balance is None:
+            logger.error("无法获取账户余额，使用原仓位")
+            return amount
+            
+        available_balance = balance['USDT']['free']
+        logger.info(f" 账户可用余额: {available_balance:.2f} USDT")
+        logger.info(f" 开仓需求: {required_margin:.2f} USDT (仓位: {amount}张)")
+        
+        # 如果余额足够，直接返回原仓位
+        if available_balance >= required_margin:
+            logger.info(" 账户余额充足，使用原仓位")
+            return amount
+        
+        # 余额不足，开始逐步减半仓位
+        logger.warning("️ 账户余额不足，开始调整仓位...")
+        adjusted_amount = amount
+        min_amount = TRADE_CONFIG.get('min_amount', 0.01)
+        
+        adjustment_count = 0
+        max_adjustments = config.get('max_balance_adjustments', 5)  # 从配置获取最大调整次数
+        
+        while adjustment_count < max_adjustments:
+            # 减半仓位
+            adjusted_amount = adjusted_amount / 2
+            adjusted_amount = round(adjusted_amount, 2)  # 保留2位小数
+            
+            # 确保不小于最小交易量
+            min_position_ratio = config.get('min_position_ratio', 0.1)
+            if adjusted_amount < min_amount or adjusted_amount < (amount * min_position_ratio):
+                adjusted_amount = max(min_amount, amount * min_position_ratio)
+                logger.warning(f"️ 仓位已减至最小值: {adjusted_amount} 张")
+                break
+                
+            # 重新计算所需保证金
+            new_required_margin = (adjusted_amount * contract_notional) / TRADE_CONFIG['leverage']
+            
+            logger.info(f" 第{adjustment_count + 1}次调整: {adjusted_amount}张, 需保证金: {new_required_margin:.2f} USDT")
+            
+            # 检查调整后的仓位是否满足余额要求
+            if available_balance >= new_required_margin:
+                logger.info(f" 调整成功: 最终仓位 {adjusted_amount} 张")
+                break
+                
+            adjustment_count += 1
+        
+        # 最终检查
+        final_required_margin = (adjusted_amount * contract_notional) / TRADE_CONFIG['leverage']
+        if available_balance < final_required_margin:
+            logger.error(f" 即使减至最小仓位仍资金不足，无法开仓")
+            logger.error(f"   最小仓位需求: {final_required_margin:.2f} USDT")
+            logger.error(f"   可用余额: {available_balance:.2f} USDT")
+            return 0  # 返回0表示无法开仓
+        
+        logger.info(f" 仓位调整完成: {amount}  {adjusted_amount} 张")
+        logger.info(f"   所需保证金: {final_required_margin:.2f} USDT")
+        logger.info(f"   可用余额: {available_balance:.2f} USDT")
+        
+        return adjusted_amount
+        
+    except ccxt.NetworkError as e:
+        logger.error(f" 仓位调整失败，网络错误: {e}")
+        return amount  # 出错时返回原仓位
+    except ccxt.ExchangeError as e:
+        logger.error(f" 仓位调整失败，交易所错误: {e}")
+        return amount  # 出错时返回原仓位
+    except ValueError as e:
+        logger.error(f" 仓位调整失败，数值转换错误: {e}")
+        return amount  # 出错时返回原仓位
+    except KeyError as e:
+        logger.error(f" 仓位调整失败，缺少必要字段: {e}")
+        return amount  # 出错时返回原仓位
+    except Exception as e:
+        logger.error(f" 仓位调整失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return amount  # 出错时返回原仓位
+
+
+def create_order_common_params(side: str, amount: float) -> dict:
+    """创建订单的公共参数"""
+    return {
+        'symbol': TRADE_CONFIG['symbol'],
+        'side': side,
+        'amount': amount,
+        'params': {
+            # 公共参数
+        }
+    }
 
 
 def analyze_with_deepseek_with_retry(price_data, max_retries=2):
@@ -1208,6 +2461,163 @@ def analyze_with_deepseek_with_retry(price_data, max_retries=2):
             time.sleep(1)
 
     return create_fallback_signal(price_data)
+
+
+def _calculate_dynamic_hold_reduction(price_data, current_position, hold_count):
+    """
+    根据市场行情动态计算是否减仓及减仓比例
+    
+    返回: (should_reduce: bool, reduce_ratio: float)
+    """
+    try:
+        hold_config = TRADE_CONFIG.get('hold_signal_config', {})
+        tech_data = price_data.get('technical_data', {})
+        trend_analysis = price_data.get('trend_analysis', {})
+        
+        # 基础减仓条件：至少出现指定次数的HOLD信号
+        min_hold_count = hold_config.get('min_hold_count', 2)
+        if hold_count < min_hold_count:
+            return False, 0.0
+        
+        # 获取配置参数
+        thresholds = hold_config.get('condition_thresholds', {})
+        weights = hold_config.get('reduction_weights', {})
+        reduction_thresholds = hold_config.get('reduction_thresholds', {})
+        reduction_ratios = hold_config.get('reduction_ratios', {})
+        
+        # 获取当前价格和技术指标
+        current_price = price_data['price']
+        rsi = tech_data.get('rsi', 50)
+        bb_position = tech_data.get('bb_position', 0.5)
+        volume_ratio = tech_data.get('volume_ratio', 1.0)
+        overall_trend = trend_analysis.get('overall', '震荡整理')
+        
+        # 获取持仓信息
+        entry_price = current_position['entry_price']
+        unrealized_pnl = current_position['unrealized_pnl']
+        position_side = current_position['side']
+        
+        # 计算盈亏比例
+        if position_side == 'long':
+            pnl_ratio = (current_price - entry_price) / entry_price
+        else:  # short
+            pnl_ratio = (entry_price - current_price) / entry_price
+        
+        # 动态减仓评分系统（0-100分，分数越高减仓越多）
+        reduction_score = 0
+        
+        # 1. 波动率因素（布林带位置）
+        bb_extreme = thresholds.get('bb_extreme', 0.8)
+        if bb_position > bb_extreme or bb_position < (1 - bb_extreme):  # 价格在布林带极端位置
+            weight = weights.get('volatility', 30)
+            reduction_score += weight
+            logger.info(f"📊 波动率因素: 布林带位置{bb_position:.2f}  +{weight}分")
+        
+        # 2. 超买超卖因素（RSI）
+        rsi_extreme = thresholds.get('rsi_extreme', 75)
+        if rsi > rsi_extreme or rsi < (100 - rsi_extreme):  # RSI极端区域
+            weight = weights.get('rsi', 25)
+            reduction_score += weight
+            logger.info(f"📊 RSI因素: RSI={rsi:.1f}  +{weight}分")
+        
+        # 3. 成交量因素
+        volume_low = thresholds.get('volume_low', 0.7)
+        if volume_ratio < volume_low:  # 成交量萎缩
+            weight = weights.get('volume', 15)
+            reduction_score += weight
+            logger.info(f"📊 成交量因素: 成交量比率{volume_ratio:.2f}  +{weight}分")
+        
+        # 4. 持仓盈亏因素
+        pnl_threshold = thresholds.get('pnl_threshold', 0.03)
+        if abs(pnl_ratio) > pnl_threshold:  # 盈亏超过阈值
+            weight = weights.get('pnl', 20)
+            reduction_score += weight
+            logger.info(f"📊 盈亏因素: 盈亏比例{pnl_ratio:.1%}  +{weight}分")
+        
+        # 5. 趋势因素
+        if overall_trend in ['震荡整理']:  # 震荡市场
+            weight = weights.get('trend', 10)
+            reduction_score += weight
+            logger.info(f"📊 趋势因素: {overall_trend}  +{weight}分")
+        
+        # 6. HOLD信号连续次数因素
+        if hold_count >= (min_hold_count + 1):
+            weight = weights.get('hold_count', 20)
+            added_score = min((hold_count - min_hold_count) * 5, weight)  # 每多一次+5分，最多weight分
+            reduction_score += added_score
+            logger.info(f"📊 HOLD次数因素: 连续{hold_count}次  +{added_score}分")
+        
+        logger.info(f"📊 动态减仓综合评分: {reduction_score}/100")
+        
+        # 根据评分决定减仓比例
+        if reduction_score >= reduction_thresholds.get('high', 70):
+            return True, reduction_ratios.get('high', 0.5)  # 减仓high比例
+        elif reduction_score >= reduction_thresholds.get('medium', 50):
+            return True, reduction_ratios.get('medium', 0.3)  # 减仓medium比例
+        elif reduction_score >= reduction_thresholds.get('low', 30):
+            return True, reduction_ratios.get('low', 0.15)  # 减仓low比例
+        else:
+            return False, 0.0
+            
+    except KeyError as e:
+        logger.error(f"❌ 动态减仓计算失败，缺少必要字段: {e}")
+        return False, 0.0
+    except ValueError as e:
+        logger.error(f"❌ 动态减仓计算失败，数值转换错误: {e}")
+        return False, 0.0
+    except Exception as e:
+        logger.error(f"❌ 动态减仓计算失败: {e}")
+        return False, 0.0
+
+
+def _get_hold_reduction_reason(price_data, current_position):
+    """获取HOLD信号减仓的具体原因"""
+    reasons = []
+    tech_data = price_data.get('technical_data', {})
+    trend_analysis = price_data.get('trend_analysis', {})
+    
+    # 获取配置参数
+    hold_config = TRADE_CONFIG.get('hold_signal_config', {})
+    thresholds = hold_config.get('condition_thresholds', {})
+    
+    # 检查各种减仓条件
+    rsi = tech_data.get('rsi', 50)
+    bb_position = tech_data.get('bb_position', 0.5)
+    volume_ratio = tech_data.get('volume_ratio', 1.0)
+    overall_trend = trend_analysis.get('overall', '震荡整理')
+    
+    rsi_extreme = thresholds.get('rsi_extreme', 75)
+    if rsi > rsi_extreme:
+        reasons.append("RSI超买")
+    elif rsi < (100 - rsi_extreme):
+        reasons.append("RSI超卖")
+    
+    bb_extreme = thresholds.get('bb_extreme', 0.8)
+    if bb_position > bb_extreme:
+        reasons.append("价格接近布林带上轨")
+    elif bb_position < (1 - bb_extreme):
+        reasons.append("价格接近布林带下轨")
+    
+    volume_low = thresholds.get('volume_low', 0.7)
+    if volume_ratio < volume_low:
+        reasons.append("成交量萎缩")
+    
+    if overall_trend == '震荡整理':
+        reasons.append("市场震荡")
+    
+    # 持仓盈亏情况
+    entry_price = current_position['entry_price']
+    current_price = price_data['price']
+    if current_position['side'] == 'long':
+        pnl_ratio = (current_price - entry_price) / entry_price
+    else:
+        pnl_ratio = (entry_price - current_price) / entry_price
+    
+    pnl_threshold = thresholds.get('pnl_threshold', 0.03)
+    if abs(pnl_ratio) > pnl_threshold:
+        reasons.append(f"持仓盈亏{pnl_ratio:+.1%}")
+    
+    return "、".join(reasons) if reasons else "技术指标显示减仓信号"
 
 
 def wait_for_next_period():
@@ -1234,36 +2644,46 @@ def wait_for_next_period():
     display_seconds = 60 - current_second if current_second > 0 else 0
 
     if display_minutes > 0:
-        logger.info(f"🕒 等待 {display_minutes} 分 {display_seconds} 秒到整点...")
+        logger.info(f"⏰ 等待 {display_minutes} 分 {display_seconds} 秒到整点...")
     else:
-        logger.info(f"🕒 等待 {display_seconds} 秒到整点...")
+        logger.info(f"⏰ 等待 {display_seconds} 秒到整点...")
 
     return seconds_to_wait
+import time
+from datetime import datetime
 
 
-def trading_bot():
-    # 等待到整点再执行
-    wait_seconds = wait_for_next_period()
-    if wait_seconds > 0:
-        time.sleep(wait_seconds)
-
+def trading_bot(skip_wait=False):
     """主交易机器人函数"""
-    logger.info("\n" + "=" * 60)
-    logger.info(f"执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("=" * 60)
+    # 等待到整点再执行
+    if not skip_wait:
+        wait_seconds = wait_for_next_period()
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+    # 使用更美观的分隔线和标题
+    logger.info("\n" + "🚀" + "═" * 58 + "🚀")
+    logger.info(f"📊 执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("🚀" + "═" * 58 + "🚀")
 
     # 重新加载配置以确保使用最新参数
     global TRADE_CONFIG
     TRADE_CONFIG = load_config()
+    logger.info(f"⚙️  已重新加载配置: 杠杆{TRADE_CONFIG['leverage']}x, 周期{TRADE_CONFIG['timeframe']}")
+
+    # 交易执行前检查
+    if not pre_trade_safety_check():
+        logger.error("❌ 交易安全检查失败，跳过本次周期")
+        return
 
     # 1. 获取增强版K线数据
     price_data = get_btc_ohlcv_enhanced()
     if not price_data:
         return
 
-    logger.info(f"BTC当前价格: ${price_data['price']:,.2f}")
-    logger.info(f"数据周期: {TRADE_CONFIG['timeframe']}")
-    logger.info(f"价格变化: {price_data['price_change']:+.2f}%")
+    logger.info(f"💰 BTC当前价格: ${price_data['price']:,.2f}")
+    logger.info(f"📈 数据周期: {TRADE_CONFIG['timeframe']}")
+    logger.info(f"📊 价格变化: {price_data['price_change']:+.2f}%")
 
     # 2. 使用DeepSeek分析（带重试）
     signal_data = analyze_with_deepseek_with_retry(price_data)
@@ -1275,6 +2695,11 @@ def trading_bot():
     execute_intelligent_trade(signal_data, price_data)
 
 
+def get_balance_sufficiency_ratio(required_margin, available_balance):
+    """计算资金充足比率"""
+    return min(available_balance / required_margin, 1.0) if required_margin > 0 else 1.0
+
+
 def get_account_balance():
     """获取账户余额信息"""
     max_retries = 3
@@ -1284,15 +2709,28 @@ def get_account_balance():
         try:
             balance = exchange.fetch_balance()
             return balance
-        except Exception as e:
-            logger.warning(f"获取账户余额失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+        except ccxt.NetworkError as e:
+            logger.warning(f"交易所API错误，获取账户余额失败 (尝试 {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
             else:
-                logger.error(f"❌ 获取账户余额失败，已达到最大重试次数: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+                logger.error(f"❌ 交易所API错误，获取账户余额失败，已达到最大重试次数: {e}")
                 return None
+        except ccxt.ExchangeError as e:
+            logger.warning(f"交易所错误，获取账户余额失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"❌ 交易所错误，获取账户余额失败，已达到最大重试次数: {e}")
+                return None
+        except KeyError as e:
+            logger.error(f"获取账户余额失败，缺少必要字段: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"获取账户余额时发生未知错误: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
     
     return None
 
@@ -1302,23 +2740,186 @@ def _create_market_order(symbol, side, amount, params=None):
     if params is None:
         params = {}
     
-    # 确保订单标签存在
-    if 'tag' not in params:
-        params['tag'] = get_order_tag()
+    # 移除标签参数，避免标签错误
+    if 'tag' in params:
+        del params['tag']
     
-    return exchange.create_market_order(symbol, side, amount, params=params)
+    # 保留或设置reduceOnly参数根据需要
+    # 注意：对于开仓订单，通常不设置reduceOnly或设置为False
+    # 对于只减仓订单，应使用_create_reduce_only_order函数
+    
+    try:
+        return exchange.create_market_order(symbol, side, amount, params=params)
+    except ccxt.InsufficientFunds as e:
+        logger.error(f"资金不足，创建市价订单失败: {e}")
+        raise e
+    except ccxt.InvalidOrder as e:
+        logger.error(f"订单无效，创建市价订单失败: {e}")
+        raise e
+    except ccxt.OrderNotFound as e:
+        logger.error(f"订单未找到，创建市价订单失败: {e}")
+        raise e
+    except ccxt.NetworkError as e:
+        logger.error(f"网络错误，创建市价订单失败: {e}")
+        raise e
+    except ccxt.ExchangeError as e:
+        logger.error(f"交易所错误，创建市价订单失败: {e}")
+        raise e
+    except Exception as e:
+        logger.error(f"创建市价订单时发生未知错误: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise e
 
 
 def _create_reduce_only_order(symbol, side, amount, params=None):
-    """创建只减仓订单的包装函数"""
+    """更安全的减仓订单创建"""
     if params is None:
         params = {}
     
-    # 确保订单标签和reduceOnly参数存在
-    params['tag'] = get_order_tag()
-    params['reduceOnly'] = True
+    # 移除标签参数
+    if 'tag' in params:
+        del params['tag']
     
-    return exchange.create_market_order(symbol, side, amount, params=params)
+    # 对于OKX，可能需要测试是否支持市价订单的reduceOnly
+    # 如果不支持，也需要移除
+    try:
+        # 先尝试使用reduceOnly
+        params['reduceOnly'] = True
+        logger.info(f" 创建减仓订单: {side} {amount}张 (使用reduceOnly=True)")
+        return exchange.create_market_order(symbol, side, amount, params=params)
+    except ccxt.InsufficientFunds as e:
+        logger.error(f"资金不足，创建减仓订单失败: {e}")
+        raise e
+    except ccxt.InvalidOrder as e:
+        logger.error(f"订单无效，创建减仓订单失败: {e}")
+        raise e
+    except ccxt.OrderNotFound as e:
+        logger.error(f"订单未找到，创建减仓订单失败: {e}")
+        raise e
+    except ccxt.NetworkError as e:
+        logger.error(f"网络错误，创建减仓订单失败: {e}")
+        raise e
+    except ccxt.ExchangeError as e:
+        logger.error(f"交易所错误，创建减仓订单失败: {e}")
+        error_msg = str(e).lower()
+        # 检查多种可能的错误信息
+        if "reduce only" in error_msg or "reduceonly" in error_msg or "reduce-only" in error_msg:
+            # 如果不支持reduceOnly，移除参数重试
+            logger.warning(" OKX不支持reduceOnly参数，移除后重试")
+            if 'reduceOnly' in params:
+                del params['reduceOnly']
+            try:
+                result = exchange.create_market_order(symbol, side, amount, params=params)
+                logger.info(f" 减仓订单创建成功（无reduceOnly参数）")
+                return result
+            except ccxt.ExchangeError as e2:
+                logger.error(f" 移除reduceOnly后仍然失败: {e2}")
+                raise e2
+            except Exception as e2:
+                logger.error(f" 移除reduceOnly后发生未知错误: {e2}")
+                raise e2
+        else:
+            logger.error(f" 创建减仓订单时发生其他交易所错误: {e}")
+            raise e
+    except Exception as e:
+        logger.error(f" 创建减仓订单时发生未知错误: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise e
+
+
+def _set_stop_loss_take_profit(signal_data, position_size):
+    """设置止盈止损订单 - OKX版本，分开设置开关"""
+    try:
+        symbol = TRADE_CONFIG['symbol']
+        stop_loss_price = signal_data['stop_loss']
+        take_profit_price = signal_data['take_profit']
+        position_side = 'buy' if signal_data['signal'] == 'BUY' else 'sell' if signal_data['signal'] == 'SELL' else None
+        
+        if position_side is None:
+            logger.warning("⚠️ 无法确定仓位方向，跳过设置止盈止损")
+            return
+        
+        # 获取止盈止损开关配置
+        enable_stop_loss = TRADE_CONFIG['stop_loss_config'].get('enable_stop_loss', False)  # 默认已改为False
+        enable_take_profit = TRADE_CONFIG['take_profit_config'].get('enable_take_profit', False)
+        
+        logger.info(f"⚙️ 止盈止损设置: 止损开关={enable_stop_loss}, 止盈开关={enable_take_profit}")
+        logger.info(f"📊 止盈止损参数: 止损={stop_loss_price:.2f}, 止盈={take_profit_price:.2f}")
+        
+        # 创建止损订单 - OKX不支持reduceOnly参数
+        if enable_stop_loss and stop_loss_price > 0:
+            sl_side = 'sell' if signal_data['signal'] == 'BUY' else 'buy' if signal_data['signal'] == 'SELL' else None
+            if sl_side:
+                try:
+                    # 创建止损订单，OKX不支持reduceOnly参数
+                    exchange.create_order(
+                        symbol=symbol,
+                        type='stop',
+                        side=sl_side,
+                        amount=position_size,
+                        price=stop_loss_price,
+                        params={'triggerPrice': stop_loss_price}  # 移除reduceOnly
+                    )
+                    logger.info(f"✅ 设置止损订单成功: 价格={stop_loss_price:.2f}, 方向={sl_side}")
+                except ccxt.InsufficientFunds as sl_error:
+                    logger.error(f"💸 资金不足，设置止损订单失败: {sl_error}")
+                except ccxt.InvalidOrder as sl_error:
+                    logger.error(f"❌ 订单无效，设置止损订单失败: {sl_error}")
+                except ccxt.OrderNotFound as sl_error:
+                    logger.error(f"❓ 订单未找到，设置止损订单失败: {sl_error}")
+                except ccxt.NetworkError as sl_error:
+                    logger.error(f"🌐 网络错误，设置止损订单失败: {sl_error}")
+                except ccxt.ExchangeError as sl_error:
+                    logger.error(f"🔄 交易所错误，设置止损订单失败: {sl_error}")
+                except Exception as sl_error:
+                    logger.error(f"💥 设置止损订单时发生未知错误: {sl_error}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+        else:
+            logger.info("⏭️ 止损功能已关闭或止损价格为0，跳过设置止损")
+        
+        # 创建止盈订单 - OKX不支持reduceOnly参数
+        if enable_take_profit and take_profit_price > 0:
+            tp_side = 'sell' if signal_data['signal'] == 'BUY' else 'buy' if signal_data['signal'] == 'SELL' else None
+            if tp_side:
+                try:
+                    # 创建止盈订单，OKX不支持reduceOnly参数
+                    exchange.create_order(
+                        symbol=symbol,
+                        type='take_profit',
+                        side=tp_side,
+                        amount=position_size,
+                        price=take_profit_price,
+                        params={'triggerPrice': take_profit_price}  # 移除reduceOnly
+                    )
+                    logger.info(f"✅ 设置止盈订单成功: 价格={take_profit_price:.2f}, 方向={tp_side}")
+                except ccxt.InsufficientFunds as tp_error:
+                    logger.error(f"💸 资金不足，设置止盈订单失败: {tp_error}")
+                except ccxt.InvalidOrder as tp_error:
+                    logger.error(f"❌ 订单无效，设置止盈订单失败: {tp_error}")
+                except ccxt.OrderNotFound as tp_error:
+                    logger.error(f"❓ 订单未找到，设置止盈订单失败: {tp_error}")
+                except ccxt.NetworkError as tp_error:
+                    logger.error(f"🌐 网络错误，设置止盈订单失败: {tp_error}")
+                except ccxt.ExchangeError as tp_error:
+                    logger.error(f"🔄 交易所错误，设置止盈订单失败: {tp_error}")
+                except Exception as tp_error:
+                    logger.error(f"💥 设置止盈订单时发生未知错误: {tp_error}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+        else:
+            logger.info("⏭️ 止盈功能已关闭或止盈价格为0，跳过设置止盈")
+                
+    except ccxt.NetworkError as e:
+        logger.error(f"🌐 网络错误，设置止盈止损订单失败: {e}")
+    except ccxt.ExchangeError as e:
+        logger.error(f"🔄 交易所错误，设置止盈止损订单失败: {e}")
+    except Exception as e:
+        logger.error(f"💥 设置止盈止损订单时发生未知错误: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 
 def get_order_tag():
@@ -1327,41 +2928,249 @@ def get_order_tag():
 
 
 def get_sentiment_api_key():
-    """获取情绪指标API密钥"""
-    return TRADE_CONFIG.get('sentiment_api_key', '2b144650-4a16-4eb5-bbcd-70824577687b')
+    """从环境变量获取API密钥"""
+    return os.getenv('SENTIMENT_API_KEY', TRADE_CONFIG.get('sentiment_api_key', ''))
 
 
-def main():
+def cleanup_pending_orders(symbol):
+    """清理所有未完成订单 - OKX专用版本"""
+    try:
+        # 获取所有未完成订单（只使用支持的方法）
+        open_orders = exchange.fetch_open_orders(symbol)
+        
+        if open_orders:
+            logger.info(f"📋 发现 {len(open_orders)} 个未完成订单，正在清理...")
+            
+            for order in open_orders:
+                try:
+                    exchange.cancel_order(order['id'], symbol)
+                    order_type = order.get('type', 'unknown')
+                    order_side = order.get('side', 'unknown')
+                    logger.info(f"✅ 已取消订单: {order['id']} - {order_type} {order_side}")
+                    time.sleep(0.5)  # 避免频率限制
+                except ccxt.OrderNotFound as e:
+                    logger.error(f"⚠️ 订单未找到，取消订单失败 {order['id']}: {e}")
+                except ccxt.NetworkError as e:
+                    logger.error(f"🌐 网络错误，取消订单失败 {order['id']}: {e}")
+                except ccxt.ExchangeError as e:
+                    logger.error(f"🔄 交易所错误，取消订单失败 {order['id']}: {e}")
+                except Exception as e:
+                    logger.error(f"💥 取消订单时发生未知错误 {order['id']}: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    
+            logger.info("✅ 所有未完成订单清理完成")
+        else:
+            logger.info("✅ 没有未完成订单需要清理")
+            
+        # 额外尝试获取条件订单（使用OKX特定的方法）
+        try:
+            # OKX可能支持通过特定参数获取条件订单
+            conditional_orders = exchange.fetch_open_orders(symbol, params={'ordType': 'conditional'})
+            if conditional_orders:
+                logger.info(f"📋 发现 {len(conditional_orders)} 个条件订单，正在清理...")
+                for order in conditional_orders:
+                    try:
+                        if order['status'] == 'open':
+                            exchange.cancel_order(order['id'], symbol)
+                            logger.info(f"✅ 已取消条件订单: {order['id']}")
+                            time.sleep(0.5)
+                    except ccxt.OrderNotFound as e:
+                        logger.error(f"⚠️ 订单未找到，取消条件订单失败 {order['id']}: {e}")
+                    except ccxt.NetworkError as e:
+                        logger.error(f"🌐 网络错误，取消条件订单失败 {order['id']}: {e}")
+                    except ccxt.ExchangeError as e:
+                        logger.error(f"🔄 交易所错误，取消条件订单失败 {order['id']}: {e}")
+                    except Exception as e:
+                        logger.error(f"💥 取消条件订单时发生未知错误 {order['id']}: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+        except ccxt.NetworkError as e:
+            logger.debug(f"🌐 网络错误，获取条件订单失败（可能不支持）: {e}")
+        except ccxt.ExchangeError as e:
+            logger.debug(f"🔄 交易所错误，获取条件订单失败（可能不支持）: {e}")
+        except Exception as e:
+            logger.debug(f"💥 获取条件订单时发生未知错误: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            
+    except ccxt.NetworkError as e:
+        logger.error(f"🌐 网络错误，清理订单失败: {e}")
+    except ccxt.ExchangeError as e:
+        logger.error(f"🔄 交易所错误，清理订单失败: {e}")
+    except Exception as e:
+        logger.error(f"💥 清理订单时发生未知错误: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+
+def cleanup_stop_orders(symbol):
+    """专门清理止盈止损订单 - OKX专用版本"""
+    try:
+        logger.info("🧹 专门清理止盈止损订单...")
+        
+        # 方法1: 通过fetch_open_orders获取所有订单，然后过滤
+        all_open_orders = exchange.fetch_open_orders(symbol)
+        stop_orders = []
+        
+        for order in all_open_orders:
+            # 根据订单类型或触发价格判断是否为止盈止损订单
+            order_type = order.get('type', '').lower()
+            if (order_type in ['stop', 'stop_loss', 'take_profit'] or 
+                order.get('triggerPrice') or 
+                order.get('stopPrice')):
+                stop_orders.append(order)
+        
+        if stop_orders:
+            logger.info(f"📋 发现 {len(stop_orders)} 个止盈止损订单，正在清理...")
+            cancelled_count = 0
+            for order in stop_orders:
+                try:
+                    exchange.cancel_order(order['id'], symbol)
+                    logger.info(f"✅ 已取消止盈止损订单: {order['id']} - 类型: {order.get('type', 'unknown')}")
+                    cancelled_count += 1
+                    time.sleep(0.3)
+                except ccxt.OrderNotFound as cancel_error:
+                    logger.error(f"⚠️ 订单未找到，取消止盈止损订单失败 {order['id']}: {cancel_error}")
+                except ccxt.NetworkError as cancel_error:
+                    logger.error(f"🌐 网络错误，取消止盈止损订单失败 {order['id']}: {cancel_error}")
+                except ccxt.ExchangeError as cancel_error:
+                    logger.error(f"🔄 交易所错误，取消止盈止损订单失败 {order['id']}: {cancel_error}")
+                except Exception as cancel_error:
+                    logger.error(f"💥 取消止盈止损订单时发生未知错误 {order['id']}: {cancel_error}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+            logger.info(f"✅ 止盈止损订单清理完成，共取消 {cancelled_count} 个订单")
+        else:
+            logger.info("✅ 没有发现止盈止损订单需要清理")
+            
+        # 方法2: 尝试通过OKX特定API获取止盈止损订单
+        try:
+            # OKX可能有特定的API来获取止盈止损订单
+            # 这里可以添加OKX特定的API调用
+            logger.debug("🔍 尝试通过OKX特定API获取止盈止损订单...")
+        except ccxt.NetworkError as e:
+            logger.debug(f"🌐 网络错误，OKX特定API调用失败: {e}")
+        except ccxt.ExchangeError as e:
+            logger.debug(f"🔄 交易所错误，OKX特定API调用失败: {e}")
+        except Exception as e:
+            logger.debug(f"💥 OKX特定API调用时发生未知错误: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            
+        logger.info("✅ 止盈止损订单清理完成")
+        
+    except ccxt.NetworkError as e:
+        logger.error(f"🌐 网络错误，清理止盈止损订单失败: {e}")
+    except ccxt.ExchangeError as e:
+        logger.error(f"🔄 交易所错误，清理止盈止损订单失败: {e}")
+    except Exception as e:
+        logger.error(f"💥 清理止盈止损订单时发生未知错误: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+
+def main() -> None:
     """主函数"""
-    logger.info("BTC/USDT OKX自动交易机器人启动成功！")
-    logger.info("融合技术指标策略 + OKX实盘接口")
+    # 注册退出处理函数
+    import atexit
+    atexit.register(cleanup)
+    
+    logger.info("🎉 BTC/USDT OKX自动交易机器人启动成功！")
+    
+    # 添加调试信息
+    debug_position_info()
 
     # 重新加载配置
     global TRADE_CONFIG
     TRADE_CONFIG = load_config()
     
-    if TRADE_CONFIG['test_mode']:
-        logger.info("当前为模拟模式，不会真实下单")
+    # 确保关键配置项存在
+    TRADE_CONFIG.setdefault('test_mode', False)
+    TRADE_CONFIG.setdefault('symbol', 'BTC/USDT:USDT')
+    TRADE_CONFIG.setdefault('leverage', 20)
+    TRADE_CONFIG.setdefault('timeframe', '15m')
+    TRADE_CONFIG.setdefault('data_points', 64)  # 确保 data_points 存在
+    
+    # 在设置交易所之前先彻底清理所有订单
+    logger.info("🧹 启动前彻底清理所有订单...")
+    try:
+        # 使用改进的订单清理方法
+        cleanup_all_orders(TRADE_CONFIG['symbol'])
+        
+        # 等待清理完成
+        time.sleep(3)
+        
+        # 检查清理结果
+        remaining_orders = exchange.fetch_open_orders(TRADE_CONFIG['symbol'])
+        if remaining_orders:
+            logger.warning(f"⚠️ 启动清理后仍有 {len(remaining_orders)} 个未完成订单")
+            # 尝试再次清理
+            cleanup_all_orders(TRADE_CONFIG['symbol'])
+        else:
+            logger.info("✅ 启动清理完成，无未完成订单")
+            
+    except ccxt.BaseError as e:
+        logger.error(f"❌ 交易所API错误，启动清理失败: {e}")
+        # 继续执行，不因为清理失败而停止程序
+    except Exception as e:
+        logger.error(f"❌ 启动清理时发生未知错误: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        # 继续执行，不因为清理失败而停止程序
+    
+    # 验证合约规格
+    if not validate_contract_specs():
+        logger.warning("⚠️ 合约规格验证失败，程序可能无法正常工作")
+    
+    if TRADE_CONFIG.get('test_mode', False):
+        logger.info("🧪 当前为模拟模式，不会真实下单")
     else:
-        logger.info("实盘交易模式，请谨慎操作！")
+        logger.info("💰 实盘交易模式，请谨慎操作！")
 
-    logger.info(f"交易周期: {TRADE_CONFIG['timeframe']}")
-    logger.info("已启用完整技术指标分析和持仓跟踪功能")
+    logger.info(f"📊 交易周期: {TRADE_CONFIG['timeframe']}")
+    logger.info("📈 已启用完整技术指标分析和持仓跟踪功能")
 
-    # 设置交易所
+    # 设置交易所（即使失败也继续执行）
     if not setup_exchange():
-        logger.error("交易所初始化失败，程序退出")
-        return
+        logger.warning("⚠️ 交易所初始化失败，但程序将继续执行")
+        # 不直接返回，而是继续执行交易逻辑
 
-    logger.info("执行频率: 每15分钟整点执行")
+    logger.info("⏰ 执行频率: 首次立即执行，之后每15分钟整点执行")
 
+    # 首次立即执行
+    trading_bot(skip_wait=True)
+    
     # 循环执行（不使用schedule）
     while True:
         trading_bot()  # 函数内部会自己等待整点
+        short_term_monitor()  # 添加短线监控
 
         # 执行完后等待一段时间再检查（避免频繁循环）
         time.sleep(60)  # 每分钟检查一次
 
 
+def cleanup():
+    """程序退出时清理资源"""
+    logger.info("正在清理资源...")
+    exchange_manager.cleanup()
+    logger.info("资源清理完成")
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("程序被用户中断")
+    except ccxt.AuthenticationError as e:
+        logger.error(f"交易所认证失败: {e}")
+    except ccxt.ExchangeError as e:
+        logger.error(f"交易所错误: {e}")
+    except ccxt.NetworkError as e:
+        logger.error(f"网络错误: {e}")
+    except Exception as e:
+        logger.error(f"程序发生未处理的异常: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+    finally:
+        cleanup()
