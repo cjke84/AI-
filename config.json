@@ -1,39 +1,181 @@
 {
-  "symbol": "BTC/USDT:USDT",
-  "leverage": 50,
-  "timeframe": "15m",
-  "test_mode": false,
-  "data_points": 96,
-  "contract_size": 1,
-  "min_amount": 0.01,
-  "okx_order_tag": "60bb4a8d3416BCDE",
-  "sentiment_api_key": "2b144650-4a16-4eb5-bbcd-70824577687b",
+  "version": "1.0.0",
+  "environment": "production",
+  "trading": {
+    "symbol": "BTC/USDT:USDT",
+    "leverage": 20,
+    "timeframe": "15m",
+    "test_mode": false,
+    "use_demo_trading": true,
+    "risk_management": {
+      "risk_per_trade": 0.1,
+      "max_portfolio_risk": 0.5,
+      "min_position_size": 0.01,
+      "max_position_size": 1.0,
+      "position_sizing_mode": "fixed",
+      "max_position_hold_bars": 2,
+      "trailing_stop_ratio": 0.003,
+      "min_confidence": "LOW"
+    },
+    "data": {
+      "data_points": 64,
+      "kline_cache_size": 8
+    },
+    "strategy": {
+      "expected_hold_bars": {
+        "default": 1,
+        "min": 1,
+        "max": 2
+      }
+    }
+  },
+  "api": {
+    "deepseek_timeout": 30,
+    "exchange_timeout": 10,
+    "max_retries": 3
+  },
+  "logging": {
+    "level": "INFO",
+    "max_file_size_mb": 10,
+    "backup_count": 5,
+    "log_trades": true,
+    "log_signals": true,
+    "log_prompts": false
+  },
+  "analysis": {
+    "short_term_period": 8,
+    "medium_term_period": 24,
+    "long_term_period": 64
+  },
+  "deepseek": {
+    "system_role": "您是一位激进的加密货币交易员，专注于高频交易和快速获利。请根据技术指标快速判断市场走势，敢于承担高风险以获得高回报。请严格遵循JSON格式要求。",
+    "temperature": 0.7,
+    "model": "deepseek-chat",
+    "max_tokens": 1000
+  },
+  "trading_strategy": {
+    "indicators_weight": {
+      "trend": "MEDIUM",
+      "rsi": "HIGH",
+      "macd": "HIGH",
+      "bollinger_bands": "MEDIUM"
+    },
+    "position_sizing": {
+      "mode": "fixed",
+      "confidence_mapping": {
+        "LOW": 0.4,
+        "MEDIUM": 0.8,
+        "HIGH": 1.2
+      },
+      "trend_strength_mapping": {
+        "WEAK": 0.8,
+        "MODERATE": 0.9,
+        "STRONG": 1.1
+      }
+    }
+  },
+  "technical_analysis": {
+    "indicators": {
+      "sma_periods": [3, 5, 8, 20, 50],
+      "ema_periods": [3, 5, 8],
+      "rsi_period": 5,
+      "macd_fast": 5,
+      "macd_slow": 10,
+      "macd_signal": 3,
+      "bollinger_bands_period": 10,
+      "bollinger_bands_std": 1.5,
+      "stoch_rsi_period": 5,
+      "atr_period": 5
+    },
+    "thresholds": {
+      "rsi_overbought": 70,
+      "rsi_oversold": 30,
+      "stoch_rsi_overbought": 0.7,
+      "stoch_rsi_oversold": 0.3,
+      "volume_above_average": 1.1
+    }
+  },
+  "monitoring": {
+    "health_check_interval": 60,
+    "alert_thresholds": {
+      "max_consecutive_losses": 10,
+      "max_drawdown_percentage": 20.0,
+      "min_balance_percentage": 1.0
+    }
+  },
   "position_management": {
     "enable_intelligent_position": true,
-    "base_usdt_amount": 200,
-    "fixed_position_size": 6.2,
+    "base_usdt_amount": 100,
+    "fixed_position_size": 3.0,
     "default_account_balance": 1000,
-    "high_confidence_multiplier": 1.5,
-    "medium_confidence_multiplier": 1.0,
-    "low_confidence_multiplier": 0.5,
-    "max_position_ratio": 70,
-    "trend_strength_multiplier": 1.2,
+    "high_confidence_multiplier": 1.2,
+    "medium_confidence_multiplier": 0.8,
+    "low_confidence_multiplier": 0.4,
+    "max_position_ratio": 40,
+    "trend_strength_multiplier": 1.1,
     "volatility_multiplier": {
-      "low": 1.1,
-      "medium": 1.0,
-      "high": 0.8
+      "low": 1.0,
+      "medium": 0.9,
+      "high": 0.6
     },
     "volume_multiplier": {
-      "low": 0.8,
+      "low": 0.7,
       "medium": 1.0,
-      "high": 1.2
+      "high": 1.1
     },
-    "position_decay_factor": 0.9,
-    "min_position": 0.01
+    "position_decay_factor": 0.85,
+    "min_position": 0.01,
+    "max_balance_adjustments": 5,
+    "min_position_ratio": 0.1
+  },
+  "stop_loss_config": {
+    "high_confidence_multiplier": 0.985,
+    "medium_confidence_multiplier": 0.98,
+    "low_confidence_multiplier": 0.975,
+    "enable_stop_loss": false
+  },
+  "take_profit_config": {
+    "high_confidence_multiplier": 1.015,
+    "medium_confidence_multiplier": 1.02,
+    "low_confidence_multiplier": 1.025,
+    "enable_take_profit": false
   },
   "hold_signal_config": {
-    "enable_hold_reduce": false,
-    "reduce_on_nth_hold": 2,
-    "reduce_ratio": 0.5
+    "enable_hold_reduce": true,
+    "enable_dynamic_reduction": true,
+    "min_hold_count": 1,
+    "reduction_thresholds": {
+      "high": 60,
+      "medium": 40,
+      "low": 25
+    },
+    "reduction_ratios": {
+      "high": 0.7,
+      "medium": 0.5,
+      "low": 0.3
+    },
+    "reduction_weights": {
+      "volatility": 25,
+      "rsi": 30,
+      "volume": 20,
+      "pnl": 15,
+      "trend": 5,
+      "hold_count": 25
+    },
+    "condition_thresholds": {
+      "bb_extreme": 0.75,
+      "rsi_extreme": 70,
+      "volume_low": 0.8,
+      "pnl_threshold": 0.02
+    }
+  },
+  "short_term_config": {
+    "max_hold_time": 3600,
+    "quick_stop_loss_ratio": 0.03,
+    "min_trade_interval": 300
+  },
+  "retry_config": {
+    "max_retries": 3,
+    "retry_delay": 5
   }
 }
